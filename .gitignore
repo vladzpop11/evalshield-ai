@@ -1,0 +1,31 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# Node & Playwright artifacts
+node_modules/
+tests/e2e_ui/node_modules/
+tests/e2e_ui/playwright-report/
+tests/e2e_ui/test-results/
+.last-run.json
+
+# Test & Coverage artifacts
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# MLflow tracking local files
+src/ml/artifacts/mlruns/
+mlruns/
+
+# Operating System files
+.DS_Store
+Thumbs.db

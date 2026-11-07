@@ -1,0 +1,19 @@
+{
+  "name": "evalshield-ai-e2e",
+  "version": "1.0.0",
+  "description": "EvalShield-AI E2E, Visual, and WCAG Accessibility Test Suite",
+  "scripts": {
+    "test": "playwright test",
+    "test:all-browsers": "ALL_BROWSERS=1 playwright test",
+    "test:ui": "playwright test --ui",
+    "test:a11y": "playwright test specs/a11y.spec.ts",
+    "test:visual": "playwright test specs/visual.spec.ts",
+    "test:dashboard": "playwright test specs/dashboard.spec.ts"
+  },
+  "devDependencies": {
+    "@axe-core/playwright": "^4.8.5",
+    "@playwright/test": "^1.42.1",
+    "@types/node": "^20.11.24",
+    "typescript": "^5.3.3"
+  }
+}
