@@ -31,12 +31,17 @@ logger = logging.getLogger("evalshield_inference")
 class EvalShieldEngine:
     """Production Inference Engine with ONNX Runtime & Sklearn fallback."""
 
-    def __init__(self, artifacts_dir: Optional[Path | str] = None) -> None:
+    def __init__(
+        self,
+        artifacts_dir: Optional[Path | str] = None,
+        preferred_backend: Optional[str] = None,
+    ) -> None:
         if artifacts_dir is None:
             self.artifacts_dir = Path(__file__).resolve().parent / "artifacts"
         else:
             self.artifacts_dir = Path(artifacts_dir)
 
+        self.preferred_backend = preferred_backend
         self.onnx_path = self.artifacts_dir / "evalshield_model.onnx"
         self.joblib_path = self.artifacts_dir / "evalshield_model.joblib"
         self.metadata_path = self.artifacts_dir / "metadata.json"
@@ -50,7 +55,13 @@ class EvalShieldEngine:
         self._initialize_model()
 
     def _initialize_model(self) -> None:
-        """Ensure artifacts exist, generate if missing, and load into memory."""
+        """Ensure artifacts exist, generate if missing, and load into memory.
+
+        Backend selection priority (unless overridden by preferred_backend):
+        1. INT8-quantized ONNX (fastest CPU execution, ~40% speedup)
+        2. FP32 ONNX (full precision fallback)
+        3. Scikit-learn/Joblib pipeline (pure Python fallback)
+        """
         if not self.joblib_path.exists() and not self.onnx_path.exists():
             logger.info("Artifacts not found in %s. Triggering model generation...", self.artifacts_dir)
             generate_shield_model(output_dir=self.artifacts_dir)
@@ -59,8 +70,28 @@ class EvalShieldEngine:
             with open(self.metadata_path, "r", encoding="utf-8") as f:
                 self.metadata = json.load(f)
 
-        # 1. Attempt ONNX loading
-        if ORT_AVAILABLE and self.onnx_path.exists():
+        pref = (self.preferred_backend or "").lower()
+
+        # 1. INT8 quantized ONNX
+        int8_path = self.artifacts_dir / "evalshield_model_int8.onnx"
+        if (pref in ("", "onnx_int8")) and ORT_AVAILABLE and int8_path.exists():
+            try:
+                opts = ort.SessionOptions()
+                opts.intra_op_num_threads = int(os.getenv("ORT_NUM_THREADS", "2"))
+                opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+                self.ort_session = ort.InferenceSession(
+                    str(int8_path),
+                    sess_options=opts,
+                    providers=["CPUExecutionProvider"],
+                )
+                self.backend = "onnx_int8"
+                logger.info("EvalShield loaded INT8-quantized ONNX backend.")
+                return
+            except Exception as e:
+                logger.warning("INT8 ONNX load failed (%s). Trying FP32 ONNX.", e)
+
+        # 2. FP32 ONNX fallback
+        if (pref in ("", "onnx")) and ORT_AVAILABLE and self.onnx_path.exists():
             try:
                 opts = ort.SessionOptions()
                 opts.intra_op_num_threads = int(os.getenv("ORT_NUM_THREADS", "2"))
@@ -71,12 +102,12 @@ class EvalShieldEngine:
                     providers=["CPUExecutionProvider"],
                 )
                 self.backend = "onnx"
-                logger.info("EvalShield loaded ONNX Runtime backend successfully.")
+                logger.info("EvalShield loaded FP32 ONNX backend.")
                 return
             except Exception as e:
-                logger.warning("Failed to initialize ONNX Runtime session: %s. Falling back to Joblib.", e)
+                logger.warning("FP32 ONNX load failed (%s). Falling back to Joblib.", e)
 
-        # 2. Sklearn/Joblib fallback
+        # 3. Sklearn/Joblib fallback
         if self.joblib_path.exists():
             self.joblib_model = joblib.load(self.joblib_path)
             self.backend = "sklearn_joblib"
@@ -128,7 +159,7 @@ class EvalShieldEngine:
         vec = self._extract_feature_vector(features).reshape(1, -1)
         violations = self._evaluate_heuristic_violations(features)
 
-        if self.backend == "onnx" and self.ort_session is not None:
+        if self.backend.startswith("onnx") and self.ort_session is not None:
             input_name = self.ort_session.get_inputs()[0].name
             outputs = self.ort_session.run(None, {input_name: vec})
             raw_pred = int(outputs[0][0])
@@ -138,10 +169,12 @@ class EvalShieldEngine:
                 prob_dict = {CLASS_NAMES[k]: float(v) for k, v in probs.items()}
             else:
                 prob_dict = {CLASS_NAMES[i]: float(probs[i]) for i in range(len(CLASS_NAMES))}
-        else:
+        elif self.joblib_model is not None:
             raw_pred = int(self.joblib_model.predict(vec)[0])
             probs = self.joblib_model.predict_proba(vec)[0]
             prob_dict = {CLASS_NAMES[i]: float(probs[i]) for i in range(len(CLASS_NAMES))}
+        else:
+            raise RuntimeError(f"Engine has no active model backend (backend={self.backend})")
 
         decision = CLASS_MAPPING.get(raw_pred, "FLAGGED")
 

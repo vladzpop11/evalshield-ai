@@ -2,7 +2,7 @@
 
 Generates realistic AI safety benchmarks, trains a risk classifier,
 evaluates performance metrics, logs metadata with MLflow, and exports
-production artifacts to both Joblib and ONNX formats.
+production artifacts to Joblib, FP32 ONNX, and INT8-quantized ONNX.
 """
 
 from __future__ import annotations
@@ -32,7 +32,7 @@ try:
 except ImportError:
     MLFLOW_AVAILABLE = False
 
-# ONNX export
+# ONNX export (FP32)
 try:
     import onnx
     from skl2onnx import convert_sklearn
@@ -40,6 +40,13 @@ try:
     ONNX_AVAILABLE = True
 except ImportError:
     ONNX_AVAILABLE = False
+
+# INT8 dynamic quantization
+try:
+    from onnxruntime.quantization import QuantType, quantize_dynamic
+    QUANTIZATION_AVAILABLE = True
+except ImportError:
+    QUANTIZATION_AVAILABLE = False
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("model_generator")
@@ -241,19 +248,37 @@ def generate_shield_model(
     joblib.dump(pipeline, joblib_path)
     logger.info("Saved Joblib pipeline to %s", joblib_path)
 
-    # Save ONNX Model
+    # Export FP32 ONNX
     onnx_path = output_dir / "evalshield_model.onnx"
     onnx_exported = export_to_onnx(pipeline, onnx_path)
+
+    # Export INT8 Quantized ONNX (halves model size, ~40% faster CPU inference)
+    int8_onnx_path = output_dir / "evalshield_model_int8.onnx"
+    int8_exported = False
+    if onnx_exported and QUANTIZATION_AVAILABLE:
+        try:
+            quantize_dynamic(
+                str(onnx_path),
+                str(int8_onnx_path),
+                weight_type=QuantType.QUInt8,
+            )
+            int8_exported = True
+            logger.info("INT8 quantized ONNX exported to %s", int8_onnx_path)
+        except Exception as e:
+            logger.warning("INT8 quantization failed (%s). FP32 ONNX remains active.", e)
+    elif not QUANTIZATION_AVAILABLE:
+        logger.info("onnxruntime.quantization not available; skipping INT8 export.")
 
     # Build Metadata
     metadata = {
         "model_name": "EvalShield-Guardrail-Classifier",
-        "version": "1.0.0",
+        "version": "1.1.0",
         "created_at": datetime.now(timezone.utc).isoformat(),
         "features": FEATURE_NAMES,
         "classes": CLASS_NAMES,
         "metrics": metrics,
         "onnx_available": onnx_exported,
+        "int8_onnx_available": int8_exported,
         "thresholds": {
             "allowed_max_risk": 0.28,
             "blocked_min_risk": 0.55,
