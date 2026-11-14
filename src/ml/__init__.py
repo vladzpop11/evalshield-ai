@@ -4,6 +4,7 @@ from .champion_challenger import ChampionChallengerRouter, get_champion_challeng
 from .feature_extractor import TextFeatureExtractor, get_feature_extractor
 from .inference import EvalShieldEngine, get_inference_engine
 from .model_generator import generate_shield_model
+from .pii_detector import PIIDetector, PIIEntity, get_pii_detector
 
 __all__ = [
     "EvalShieldEngine",
@@ -13,4 +14,7 @@ __all__ = [
     "get_feature_extractor",
     "ChampionChallengerRouter",
     "get_champion_challenger_router",
+    "PIIDetector",
+    "PIIEntity",
+    "get_pii_detector",
 ]

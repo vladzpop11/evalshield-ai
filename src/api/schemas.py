@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class EvaluationRequest(BaseModel):
@@ -49,6 +49,7 @@ class EvaluationRequest(BaseModel):
     # Raw text inputs (enable Text Mode auto-extraction)
     prompt_text: Optional[str] = Field(default=None, description="Raw prompt text for auto feature extraction")
     response_text: Optional[str] = Field(default=None, description="Generated response text for alignment analysis")
+    redact_pii: bool = Field(default=False, description="Scan and redact sensitive PII and API credentials")
 
     # Explicit metric overrides (Metric Mode or partial overrides)
     toxicity_score: Optional[float] = Field(default=None, ge=0.0, le=1.0, description="Toxicity probability [0.0–1.0]")
@@ -57,10 +58,17 @@ class EvaluationRequest(BaseModel):
     semantic_drift: Optional[float] = Field(default=None, ge=0.0, le=1.0, description="Domain distance score [0.0–1.0]")
     token_entropy: Optional[float] = Field(default=None, ge=0.0, le=10.0, description="Token Shannon entropy [0.0–10.0]")
 
+    @field_validator("prompt_text")
+    @classmethod
+    def validate_prompt_not_blank(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None and not v.strip():
+            raise ValueError("prompt_text cannot be empty or whitespace only.")
+        return v
+
     @model_validator(mode="after")
     def require_text_or_all_metrics(self) -> "EvaluationRequest":
         """Enforce that at least one of text mode or full metric mode inputs is provided."""
-        has_text = self.prompt_text is not None
+        has_text = self.prompt_text is not None and bool(self.prompt_text.strip())
         metrics = [self.toxicity_score, self.hallucination_risk, self.prompt_injection_score,
                    self.semantic_drift, self.token_entropy]
         has_all_metrics = all(m is not None for m in metrics)
@@ -83,6 +91,18 @@ class EvaluationResponse(BaseModel):
     probabilities: Dict[str, float] = Field(..., description="Per-class probability distribution")
     violation_reasons: List[str] = Field(default_factory=list, description="Specific guardrail boundary breaches")
     category_scores: Dict[str, float] = Field(..., description="Resolved feature scores used for inference")
+    risk_contributions: Dict[str, float] = Field(
+        default_factory=dict,
+        description="Explainable feature percentage contributions to composite risk score (sums to 1.0)",
+    )
+    pii_detected: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        description="Detected sensitive PII entities or credentials",
+    )
+    sanitized_prompt: Optional[str] = Field(
+        default=None,
+        description="Sanitized text if redact_pii was enabled",
+    )
     extraction_mode: str = Field(default="metric", description="'text' if auto-extracted, 'metric' if caller-provided")
     backend: str = Field(..., description="Inference execution backend (onnx | sklearn_joblib)")
     latency_ms: float = Field(..., description="End-to-end evaluation latency in milliseconds")

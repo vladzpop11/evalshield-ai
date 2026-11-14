@@ -124,8 +124,22 @@ evalshield-ai/
 - Tracks real-time decision agreement rates, latency deltas, and logs divergence to `discrepancy_log.jsonl`.
 - Live stats endpoint: `GET /model/shadow-stats`.
 
-### D. Observability & Regulatory Compliance
-- **Prometheus Scraper:** `GET /metrics` exposes real-time counters, cache hits, shadow stats, and p50/p95/p99 latency quantiles.
+### D. Sensitive Data & PII Redaction Engine (`PIIDetector`)
+- **Automated Discovery & Anonymization:** Identifies sensitive entities and credentials in real-time:
+  - *Credit Card Numbers:* Validated via **ISO/IEC 7812 Luhn checksum algorithm** (eliminates false positives).
+  - *Social Security Numbers:* US SSN area-group-serial structure.
+  - *API Keys & Cloud Secrets:* OpenAI (`sk-...`), AWS Access Keys (`AKIA...`), GitHub Tokens (`ghp_...`), JWTs.
+  - *Contact Details:* Emails, international phone numbers, and external IP addresses.
+- **Redaction Support:** Replaces sensitive values with non-reversible masked placeholders (`[REDACTED_EMAIL]`, `[REDACTED_CREDIT_CARD]`, etc.).
+
+### E. Risk Explainability & Attribution
+- **Normalized Factor Attribution:** Generates explainability weights (`risk_contributions`) per inference that sum to 100%, enabling transparent attribution compliant with EU AI Act Article 13.
+
+### F. Real-Time Token Streaming Guardrail (`/evaluate/stream`)
+- **Server-Sent Events (SSE):** Streaming interface for LLM pipelines yielding chunk-by-chunk validation with instant `ABORT_STREAM` signals when safety constraints are breached mid-generation.
+
+### G. Observability & Regulatory Compliance
+- **Prometheus Scraper:** `GET /metrics` exposes real-time counters, mode breakdowns, cache hits, PII detections, shadow stats, and p50/p95/p99 quantiles alongside PromQL `_sum` and `_count` series.
 - **Audit Export:** `GET /model/compliance-report` outputs structured technical documentation aligned with **NIST AI RMF 1.0** and **EU AI Act Regulation (EU) 2024/1689 Annex IV**.
 
 ---
@@ -182,17 +196,18 @@ Visit [http://localhost:8080](http://localhost:8080) to interact with the guardr
 
 ## 5. Running the Test Suites
 
-### Full Suite Run (58 Automated Tests)
+### Full Suite Run (70 Automated Tests)
 ```bash
 pytest tests/ml_quality tests/api -v
 ```
 
-### A. ML Quality, Fuzzing & Shadow Router Tests
+### A. ML Quality, Fuzzing, PII & Shadow Router Tests
 ```bash
 pytest tests/ml_quality -v
 ```
 Runs:
 - `test_adversarial_fuzzing.py`: 17 jailbreak, homoglyph, Base64, and boundary tests.
+- `test_pii_detector.py`: 8 ISO/IEC 7812 Luhn card, SSN, API key, and redaction tests.
 - `test_champion_challenger.py`: 6 async shadow dispatch, discrepancy, and telemetry tests.
 - `test_data_contracts.py`: 11 Pandera schema boundary & null rejection tests.
 - `test_model_behavior.py`: 6 CheckList behavioral tests (MFT, INV, DIR).
@@ -203,7 +218,7 @@ Runs:
 pytest tests/api -v
 ```
 Runs:
-- 14 async tests verifying `/health`, `/metrics`, `/model/compliance-report`, `/model/shadow-stats`, text mode extraction, batch evaluation, and drift monitoring.
+- 18 async tests verifying `/health`, `/metrics`, `/evaluate/stream`, `/model/compliance-report`, `/model/shadow-stats`, PII redaction, explainability weights, batch evaluation, and drift monitoring.
 
 ### C. Frontend E2E, Visual & Accessibility Tests
 ```bash

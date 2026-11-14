@@ -226,3 +226,57 @@ class TestApiEndpoints:
         assert "shadow_evaluations_run" in stats
         assert "decision_agreement_rate" in stats
         assert "recent_discrepancies" in stats
+
+    async def test_evaluate_pii_detection_and_redaction(self, async_client: AsyncClient):
+        """POST /evaluate with redact_pii=True sanitizes email, phone, and card entities."""
+        payload = {
+            "prompt_id": "pii-scan-01",
+            "prompt_text": "Please reach out to support@acme-corp.com or call 555-123-4567 for key sk-test1234567890abcdef1234567890",
+            "redact_pii": True,
+        }
+        res = await async_client.post("/evaluate", json=payload)
+        assert res.status_code == 200
+        data = res.json()
+        assert len(data["pii_detected"]) >= 2
+        assert data["sanitized_prompt"] is not None
+        assert "support@acme-corp.com" not in data["sanitized_prompt"]
+        assert "[REDACTED_EMAIL]" in data["sanitized_prompt"]
+
+    async def test_evaluate_risk_contributions_explainability(self, async_client: AsyncClient):
+        """POST /evaluate returns normalized feature attribution weights summing to 1.0."""
+        payload = {
+            "prompt_id": "explain-req-01",
+            "prompt_text": "Summarize the latest financial quarterly earnings release.",
+        }
+        res = await async_client.post("/evaluate", json=payload)
+        assert res.status_code == 200
+        data = res.json()
+        assert "risk_contributions" in data
+        contribs = data["risk_contributions"]
+        assert "prompt_injection_score" in contribs
+        assert "toxicity_score" in contribs
+        # Total sum of percentage contributions should be ~1.0
+        assert 0.99 <= sum(contribs.values()) <= 1.01
+
+    async def test_evaluate_streaming_guardrail(self, async_client: AsyncClient):
+        """POST /evaluate/stream streams Server-Sent Events (SSE) in real-time."""
+        payload = {
+            "prompt_id": "stream-test-01",
+            "prompt_text": "Generate a summary of model safety parameters.",
+        }
+        res = await async_client.post("/evaluate/stream", json=payload)
+        assert res.status_code == 200
+        assert "text/event-stream" in res.headers.get("content-type", "")
+        body = res.text
+        assert "event: init" in body
+        assert "event: verdict" in body
+        assert "event: done" in body
+
+    async def test_evaluate_empty_whitespace_prompt_rejected(self, async_client: AsyncClient):
+        """POST /evaluate with purely whitespace prompt_text is rejected with HTTP 422."""
+        payload = {
+            "prompt_id": "blank-01",
+            "prompt_text": "     ",
+        }
+        res = await async_client.post("/evaluate", json=payload)
+        assert res.status_code == 422
