@@ -265,11 +265,15 @@ app.add_middleware(
 
 
 @app.middleware("http")
-async def add_timing_header(request: Request, call_next) -> Response:
-    """Inject X-Process-Time-Ms into every response for latency observability."""
+async def add_timing_and_security_headers(request: Request, call_next) -> Response:
+    """Inject timing and hardened security headers into every response."""
     t0 = time.perf_counter()
     response = await call_next(request)
     response.headers["X-Process-Time-Ms"] = f"{(time.perf_counter() - t0) * 1000.0:.2f}"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["X-XSS-Protection"] = "1; mode=block"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
     return response
 
 

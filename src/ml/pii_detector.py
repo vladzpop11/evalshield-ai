@@ -59,8 +59,8 @@ class PIIDetector:
     GITHUB_TOKEN_PATTERN = re.compile(r"\bgh[pousr]_[A-Za-z0-9_]{30,}\b")
     JWT_PATTERN = re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]+\b")
 
-    # Credit card candidates (13 to 19 digits with optional hyphens/spaces)
-    CREDIT_CARD_CANDIDATE = re.compile(r"\b(?:\d[ -]*?){13,19}\b")
+    # Credit card candidates (13 to 19 digits with optional hyphens/spaces, non-backtracking)
+    CREDIT_CARD_CANDIDATE = re.compile(r"\b\d(?:[ -]?\d){12,18}\b")
 
     @staticmethod
     def _is_luhn_valid(card_number_str: str) -> bool:

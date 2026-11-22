@@ -30,14 +30,17 @@ class TestApiEndpoints:
         assert "health_url" in body
 
     async def test_health_check(self, async_client: AsyncClient):
-        """GET /health must return healthy status and runtime diagnostics."""
+        """GET /health must return healthy status, correct version, and security headers."""
         res = await async_client.get("/health")
         assert res.status_code == 200
         data = res.json()
         assert data["status"] in ["healthy", "degraded"]
+        assert data["version"] == "1.3.0"
         assert data["model_loaded"] is True
         assert data["uptime_seconds"] >= 0.0
         assert "X-Process-Time-Ms" in res.headers
+        assert res.headers["X-Content-Type-Options"] == "nosniff"
+        assert res.headers["X-Frame-Options"] == "DENY"
 
     async def test_model_metadata(self, async_client: AsyncClient):
         """GET /model/metadata returns active feature list and class mappings."""
@@ -315,3 +318,20 @@ class TestApiEndpoints:
         assert data["recalibration_status"] in ["RECALIBRATED", "STABLE_NO_RECALIBRATION_NEEDED"]
         assert "adjusted_thresholds" in data
         assert "canary_promotion_recommended" in data
+
+    async def test_evaluate_oversized_prompt_rejected(self, async_client: AsyncClient):
+        """POST /evaluate rejects prompts exceeding maximum length limits (DoS defense)."""
+        payload = {
+            "prompt_text": "A" * 70000,
+        }
+        res = await async_client.post("/evaluate", json=payload)
+        assert res.status_code == 422
+
+    async def test_evaluate_oversized_canary_tokens_rejected(self, async_client: AsyncClient):
+        """POST /evaluate rejects canary token arrays exceeding capacity (DoS defense)."""
+        payload = {
+            "prompt_text": "Valid test prompt",
+            "canary_tokens": [f"token_{i}" for i in range(105)],
+        }
+        res = await async_client.post("/evaluate", json=payload)
+        assert res.status_code == 422

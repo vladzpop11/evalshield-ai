@@ -235,7 +235,7 @@ Visit [http://localhost:8080](http://localhost:8080) to interact with the guardr
 
 ## 5. Running the Test Suites
 
-### Full Suite Run (91 Automated Tests)
+### Full Suite Run (93 Automated Tests)
 ```bash
 pytest tests/ml_quality tests/api -v
 ```
@@ -254,12 +254,12 @@ Runs:
 - `test_model_behavior.py`: 6 CheckList behavioral tests (MFT, INV, DIR).
 - `test_metrics_drift.py`: 4 Kolmogorov-Smirnov 2-sample & PSI drift detection tests.
 
-### B. API Integration & SDK Decorator Tests (29 Tests)
+### B. API Integration & SDK Decorator Tests (31 Tests)
 ```bash
 pytest tests/api -v
 ```
 Runs:
-- `test_api_endpoints.py`: 20 async tests verifying `/health`, `/metrics`, `/evaluate/stream`, `/drift/recalibrate`, `/model/compliance-report`, `/model/shadow-stats`, PII redaction, explainability weights, batch evaluation, and canary leaks.
+- `test_api_endpoints.py`: 22 async tests verifying `/health`, `/metrics`, `/evaluate/stream`, `/drift/recalibrate`, `/model/compliance-report`, `/model/shadow-stats`, PII redaction, explainability weights, batch evaluation, canary leaks, and input DoS boundary defenses.
 - `test_sdk.py`: 9 tests verifying `EvalShieldClient` (sync & async) and `@guard.protect` decorator (blocking, PII auto-sanitization, canary leak traps, and fallback value mode).
 
 ### C. Frontend E2E, Visual & Accessibility Tests

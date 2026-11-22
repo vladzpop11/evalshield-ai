@@ -44,13 +44,13 @@ class EvaluationRequest(BaseModel):
         }
     )
 
-    prompt_id: Optional[str] = Field(default=None, description="Unique client-provided identifier")
+    prompt_id: Optional[str] = Field(default=None, max_length=128, description="Unique client-provided identifier")
 
     # Raw text inputs (enable Text Mode auto-extraction)
-    prompt_text: Optional[str] = Field(default=None, description="Raw prompt text for auto feature extraction")
-    response_text: Optional[str] = Field(default=None, description="Generated response text for alignment analysis")
+    prompt_text: Optional[str] = Field(default=None, max_length=65536, description="Raw prompt text for auto feature extraction")
+    response_text: Optional[str] = Field(default=None, max_length=65536, description="Generated response text for alignment analysis")
     redact_pii: bool = Field(default=False, description="Scan and redact sensitive PII and API credentials")
-    canary_tokens: Optional[List[str]] = Field(default=None, description="Honeytokens to detect system prompt exfiltration")
+    canary_tokens: Optional[List[str]] = Field(default=None, max_length=100, description="Honeytokens to detect system prompt exfiltration")
 
     # Explicit metric overrides (Metric Mode or partial overrides)
     toxicity_score: Optional[float] = Field(default=None, ge=0.0, le=1.0, description="Toxicity probability [0.0–1.0]")
@@ -137,7 +137,7 @@ class HealthResponse(BaseModel):
     """Service health and readiness status."""
     status: Literal["healthy", "degraded", "unhealthy"]
     service_name: str = "EvalShield-AI"
-    version: str = "1.0.0"
+    version: str = "1.3.0"
     uptime_seconds: float
     model_loaded: bool
     backend: str
