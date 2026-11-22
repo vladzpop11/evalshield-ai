@@ -45,12 +45,16 @@ from src.api.schemas import (
     EvaluationResponse,
     HealthResponse,
     ModelMetadataResponse,
+    RecalibrateRequest,
+    RecalibrateResponse,
     ShadowStatsResponse,
 )
 from src.ml.champion_challenger import ChampionChallengerRouter, get_champion_challenger_router
+from src.ml.drift_recalibration import DriftRecalibrationEngine, get_recalibration_engine
 from src.ml.feature_extractor import TextFeatureExtractor, get_feature_extractor
 from src.ml.inference import EvalShieldEngine, get_inference_engine
 from src.ml.pii_detector import PIIDetector, get_pii_detector
+from src.ml.unicode_sanitizer import UnicodeSanitizer, get_unicode_sanitizer
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("evalshield_api")
@@ -520,6 +524,24 @@ async def evaluate_single(payload: EvaluationRequest) -> EvaluationResponse:
         result["sanitized_prompt"] = sanitized_text
         result["pii_detected"] = pii_entities_list
 
+        # 3. System prompt canary honeytoken leak detection
+        result["canary_leak_detected"] = False
+        result["leaked_canary_token"] = None
+        if payload.canary_tokens and payload.response_text:
+            sanitizer = get_unicode_sanitizer()
+            is_leaked, leaked_token = sanitizer.check_canary_leak(payload.response_text, payload.canary_tokens)
+            if is_leaked:
+                result["shield_decision"] = "BLOCKED"
+                result["risk_score"] = 1.0
+                result["confidence"] = 1.0
+                result["canary_leak_detected"] = True
+                result["leaked_canary_token"] = leaked_token
+                reasons = list(result.get("violation_reasons", []))
+                reasons.append(
+                    f"CRITICAL: System prompt canary honeytoken leaked in model output ({leaked_token})"
+                )
+                result["violation_reasons"] = reasons
+
         if pii_entities_list:
             global _telemetry_pii_detected
             with _telemetry_lock:
@@ -682,3 +704,14 @@ async def check_feature_drift(request: DriftCheckRequest) -> DriftCheckResponse:
         total_features_evaluated=len(results),
         features=results,
     )
+
+
+@app.post("/drift/recalibrate", response_model=RecalibrateResponse, tags=["Drift Monitoring"])
+async def trigger_drift_recalibration(request: RecalibrateRequest) -> RecalibrateResponse:
+    """Analyze production distribution drift and trigger automated adaptive threshold recalibration."""
+    recal_engine = get_recalibration_engine()
+    result = recal_engine.recalibrate(
+        production_samples=request.production_samples,
+        significance_level=request.significance_level,
+    )
+    return RecalibrateResponse(**result.to_dict())

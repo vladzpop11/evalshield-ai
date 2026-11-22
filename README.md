@@ -60,32 +60,43 @@ evalshield-ai/
 ├── src/
 │   ├── api/
 │   │   ├── __init__.py
-│   │   ├── main.py                    # Production FastAPI v1.2 with shadow router, cache & Prometheus
+│   │   ├── main.py                    # Production FastAPI v1.3 with shadow router, cache & Prometheus
 │   │   └── schemas.py                 # Pydantic v2 schemas: dual-mode input & compliance models
-│   └── ml/
-│       ├── __init__.py
-│       ├── artifacts/
-│       │   ├── evalshield_model_int8.onnx # Quantized INT8 ONNX production model
-│       │   ├── evalshield_model.onnx      # Full-precision FP32 ONNX fallback
-│       │   ├── evalshield_model.joblib    # Scikit-learn Joblib pipeline fallback
-│       │   ├── baseline_distribution.parquet # 4,000 synthetic benchmark records
-│       │   ├── metadata.json              # Hyperparameters, metrics & schema
-│       │   └── discrepancy_log.jsonl      # Async shadow routing discrepancy log
-│       ├── champion_challenger.py     # Asynchronous shadow evaluation router
-│       ├── feature_extractor.py       # Zero-dependency in-memory NLP feature extractor
-│       ├── inference.py               # 3-tier inference engine (INT8 ONNX -> FP32 -> Joblib)
-│       └── model_generator.py         # Training, INT8 dynamic quantization & parquet generation
+│   ├── ml/
+│   │   ├── __init__.py
+│   │   ├── artifacts/
+│   │   │   ├── evalshield_model_int8.onnx # Quantized INT8 ONNX production model
+│   │   │   ├── evalshield_model.onnx      # Full-precision FP32 ONNX fallback
+│   │   │   ├── evalshield_model.joblib    # Scikit-learn Joblib pipeline fallback
+│   │   │   ├── baseline_distribution.parquet # 4,000 synthetic benchmark records
+│   │   │   ├── metadata.json              # Hyperparameters, metrics & schema
+│   │   │   └── discrepancy_log.jsonl      # Async shadow routing discrepancy log
+│   │   ├── champion_challenger.py     # Asynchronous shadow evaluation router
+│   │   ├── drift_recalibration.py     # Adaptive dynamic drift recalibration engine
+│   │   ├── feature_extractor.py       # Zero-dependency in-memory NLP feature extractor
+│   │   ├── inference.py               # 3-tier inference engine (INT8 ONNX -> FP32 -> Joblib)
+│   │   ├── model_generator.py         # Training, INT8 dynamic quantization & parquet generation
+│   │   ├── pii_detector.py            # ISO/IEC 7812 Luhn & secret redaction engine
+│   │   └── unicode_sanitizer.py       # Zero-width stripping, NFKC & homoglyph normalization
+│   └── sdk/
+│       ├── __init__.py                # SDK public exports
+│       ├── client.py                  # Sync & async EvalShieldClient with health check
+│       └── decorator.py               # Enterprise @guard.protect decorator for AI functions
 ├── tests/
 │   ├── ml_quality/
 │   │   ├── __init__.py
 │   │   ├── test_adversarial_fuzzing.py # 17 fuzzing tests (homoglyph, base64, DAN, jailbreaks)
 │   │   ├── test_champion_challenger.py # 6 shadow routing & telemetry tests
 │   │   ├── test_data_contracts.py     # 11 Pandera schema boundary & strictness tests
+│   │   ├── test_drift_recalibration.py # 3 dynamic drift adaptation tests
+│   │   ├── test_metrics_drift.py      # 4 Kolmogorov-Smirnov & PSI drift detection tests
 │   │   ├── test_model_behavior.py     # 6 CheckList behavioral tests (MFT, INV, DIR)
-│   │   └── test_metrics_drift.py      # 4 Kolmogorov-Smirnov & PSI drift detection tests
+│   │   ├── test_pii_detector.py       # 8 ISO/IEC 7812 Luhn card, SSN, API key & redaction tests
+│   │   └── test_unicode_canary.py     # 7 zero-width, homoglyph & canary leak tests
 │   ├── api/
 │   │   ├── __init__.py
-│   │   └── test_api_endpoints.py      # 14 async integration tests (text mode, metrics, audit)
+│   │   ├── test_api_endpoints.py      # 20 async integration tests (text mode, metrics, audit)
+│   │   └── test_sdk.py                # 9 client SDK & @guard.protect decorator tests
 │   ├── e2e_ui/
 │   │   ├── specs/
 │   │   │   ├── dashboard.spec.ts      # End-to-end interactive workflow tests
@@ -142,6 +153,34 @@ evalshield-ai/
 - **Prometheus Scraper:** `GET /metrics` exposes real-time counters, mode breakdowns, cache hits, PII detections, shadow stats, and p50/p95/p99 quantiles alongside PromQL `_sum` and `_count` series.
 - **Audit Export:** `GET /model/compliance-report` outputs structured technical documentation aligned with **NIST AI RMF 1.0** and **EU AI Act Regulation (EU) 2024/1689 Annex IV**.
 
+### H. Unicode Homoglyph & Zero-Width Sanitizer + Canary Leak Trap
+- **Unicode Sanitizer:** Defeats obfuscated prompt injection attacks by:
+  - Stripping zero-width/invisible evasion characters (U+200B, U+200C, U+200D, U+FEFF, U+2060, U+00AD).
+  - Normalizing full-width and mathematical bold/italic alphanumerics via NFKC.
+  - Mapping Cyrillic and Greek lookalike homoglyphs to Latin ASCII equivalents (50+ mappings).
+- **Canary Trap:** Detects system prompt honeytoken exfiltration (`SYSTEM_PROMPT_CANARY_...`) in model outputs, instantly flagging attacks and returning `BLOCKED` with risk 1.0.
+
+### I. Drop-in Python Client SDK & `@guard.protect` Decorator
+- **Python SDK (`src/sdk`):** High-performance client supporting both synchronous (`httpx` / Starlette `TestClient`) and asynchronous (`httpx.AsyncClient`) evaluation.
+- **Enterprise Decorator:**
+  ```python
+  from src.sdk import EvalShieldGuard
+
+  guard = EvalShieldGuard()
+
+  @guard.protect(on_blocked="raise", inspect_output=True, redact_pii=True)
+  def generate_llm_response(prompt: str) -> str:
+      return llm.generate(prompt)
+  ```
+  - Intercepts input before model execution and validates outputs post-generation.
+  - Automatically redacts PII before the prompt reaches downstream LLMs.
+  - Blocks canary leaks and raises `EvalShieldBlockedException` or falls back to custom values.
+
+### J. Closed-Loop Drift Recalibration Engine (`POST /drift/recalibrate`)
+- **Adaptive Quality Maintenance:** Dynamically runs Kolmogorov-Smirnov two-sample tests per feature against baseline distributions.
+- **Dynamic Threshold Adaptation:** Automatically shifts token entropy bounds and relaxes/tightens semantic drift tolerance based on drift severity score $\in [0.0, 1.0]$.
+- Complete audit history exposed at `GET /drift/recalibrate/history`.
+
 ---
 
 ## 4. Local Quickstart
@@ -196,29 +235,32 @@ Visit [http://localhost:8080](http://localhost:8080) to interact with the guardr
 
 ## 5. Running the Test Suites
 
-### Full Suite Run (70 Automated Tests)
+### Full Suite Run (91 Automated Tests)
 ```bash
 pytest tests/ml_quality tests/api -v
 ```
 
-### A. ML Quality, Fuzzing, PII & Shadow Router Tests
+### A. ML Quality, Fuzzing, PII, Unicode & Drift Recalibration Tests (62 Tests)
 ```bash
 pytest tests/ml_quality -v
 ```
 Runs:
 - `test_adversarial_fuzzing.py`: 17 jailbreak, homoglyph, Base64, and boundary tests.
+- `test_unicode_canary.py`: 7 zero-width character, homoglyph, and canary leak tests.
 - `test_pii_detector.py`: 8 ISO/IEC 7812 Luhn card, SSN, API key, and redaction tests.
+- `test_drift_recalibration.py`: 3 closed-loop dynamic drift adaptation and history tests.
 - `test_champion_challenger.py`: 6 async shadow dispatch, discrepancy, and telemetry tests.
 - `test_data_contracts.py`: 11 Pandera schema boundary & null rejection tests.
 - `test_model_behavior.py`: 6 CheckList behavioral tests (MFT, INV, DIR).
 - `test_metrics_drift.py`: 4 Kolmogorov-Smirnov 2-sample & PSI drift detection tests.
 
-### B. API Integration & Contract Tests
+### B. API Integration & SDK Decorator Tests (29 Tests)
 ```bash
 pytest tests/api -v
 ```
 Runs:
-- 18 async tests verifying `/health`, `/metrics`, `/evaluate/stream`, `/model/compliance-report`, `/model/shadow-stats`, PII redaction, explainability weights, batch evaluation, and drift monitoring.
+- `test_api_endpoints.py`: 20 async tests verifying `/health`, `/metrics`, `/evaluate/stream`, `/drift/recalibrate`, `/model/compliance-report`, `/model/shadow-stats`, PII redaction, explainability weights, batch evaluation, and canary leaks.
+- `test_sdk.py`: 9 tests verifying `EvalShieldClient` (sync & async) and `@guard.protect` decorator (blocking, PII auto-sanitization, canary leak traps, and fallback value mode).
 
 ### C. Frontend E2E, Visual & Accessibility Tests
 ```bash
@@ -266,6 +308,10 @@ docker compose -f docker/docker-compose.yml down -v
 | **Model Macro F1** | $\ge 80.0\%$ | `test_metrics_drift.py` | **88.92%** PASS |
 | **Single Inference Latency** | $< 30\text{ ms}$ | `test_model_behavior.py` | **1.5 ms** PASS |
 | **Adversarial Fuzzing** | $100\%$ attack detection | `test_adversarial_fuzzing.py` | **17/17** PASS |
+| **Unicode & Canary Defense** | $100\%$ evasion detection | `test_unicode_canary.py` | **7/7** PASS |
+| **PII & Secret Redaction** | $100\%$ Luhn & credential detection | `test_pii_detector.py` | **8/8** PASS |
+| **Drift Recalibration** | Dynamic threshold adaptation | `test_drift_recalibration.py` | **3/3** PASS |
+| **Python SDK & Guard Decorator** | In-process & remote verification | `test_sdk.py` | **9/9** PASS |
 | **Champion / Challenger Shadow** | Zero user latency impact | `test_champion_challenger.py` | **6/6** PASS |
 | **API p95 Response Time** | $< 120\text{ ms}$ (40 VUs) | `load-test.js` (k6) | **PASS** |
 | **API Error Rate** | $< 1.0\%$ | `load-test.js` (k6) | **PASS** |

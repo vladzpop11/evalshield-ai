@@ -50,6 +50,7 @@ class EvaluationRequest(BaseModel):
     prompt_text: Optional[str] = Field(default=None, description="Raw prompt text for auto feature extraction")
     response_text: Optional[str] = Field(default=None, description="Generated response text for alignment analysis")
     redact_pii: bool = Field(default=False, description="Scan and redact sensitive PII and API credentials")
+    canary_tokens: Optional[List[str]] = Field(default=None, description="Honeytokens to detect system prompt exfiltration")
 
     # Explicit metric overrides (Metric Mode or partial overrides)
     toxicity_score: Optional[float] = Field(default=None, ge=0.0, le=1.0, description="Toxicity probability [0.0–1.0]")
@@ -102,6 +103,14 @@ class EvaluationResponse(BaseModel):
     sanitized_prompt: Optional[str] = Field(
         default=None,
         description="Sanitized text if redact_pii was enabled",
+    )
+    canary_leak_detected: bool = Field(
+        default=False,
+        description="Whether a system prompt canary token was leaked in the response text",
+    )
+    leaked_canary_token: Optional[str] = Field(
+        default=None,
+        description="The specific leaked canary honeytoken if detected",
     )
     extraction_mode: str = Field(default="metric", description="'text' if auto-extracted, 'metric' if caller-provided")
     backend: str = Field(..., description="Inference execution backend (onnx | sklearn_joblib)")
@@ -167,6 +176,27 @@ class DriftCheckResponse(BaseModel):
     total_features_evaluated: int
     features: List[DriftFeatureResult]
     timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+class RecalibrateRequest(BaseModel):
+    """Payload to trigger closed-loop drift recalibration."""
+    production_samples: Dict[str, List[float]] = Field(
+        ..., description="Recent observed production samples per feature"
+    )
+    significance_level: float = Field(default=0.05, ge=0.001, le=0.20)
+
+
+class RecalibrateResponse(BaseModel):
+    """Detailed result of automated drift-triggered threshold recalibration."""
+    recalibration_id: str
+    recalibration_status: Literal["RECALIBRATED", "STABLE_NO_RECALIBRATION_NEEDED"]
+    overall_drift_detected: bool
+    features_recalibrated: List[str]
+    previous_thresholds: Dict[str, Any]
+    adjusted_thresholds: Dict[str, Any]
+    canary_promotion_recommended: bool
+    samples_evaluated: int
+    applied_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
 class ShadowStatsResponse(BaseModel):

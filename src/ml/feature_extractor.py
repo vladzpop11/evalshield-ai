@@ -16,20 +16,22 @@ import re
 from collections import Counter
 from typing import Dict, List, Optional, Tuple
 
+from .unicode_sanitizer import get_unicode_sanitizer
+
 
 class TextFeatureExtractor:
     """Zero-dependency, sub-millisecond NLP feature extraction pipeline."""
 
     # Common injection keywords, delimiter breaks, and roleplay jailbreak patterns
     INJECTION_PATTERNS = [
-        r"ignore\s+(?:all\s+)?(?:previous|prior|above)\s+instructions?",
-        r"disregard\s+(?:all\s+)?(?:previous|prior|above)\s+instructions?",
-        r"bypass\s+(?:all\s+)?(?:safety|content|security)?\s*(?:filters?|policies|guards?)?",
-        r"(?:reveal|display|output|print|show)\s+(?:the\s+)?(?:system\s+prompt|developer\s+mode|instructions|root\s+key|password|secret)",
-        r"you\s+are\s+now\s+(?:in\s+)?(?:dan|developer|jailbreak|unfiltered)\s+mode",
-        r"pretend\s+you\s+have\s+no\s+(?:rules|filters|limitations|guidelines)",
-        r"(?:system\s+override|admin\s+override|sudo\s+mode)",
-        r"roleplay\s+as\s+(?:an?\s+)?evil",
+        r"ignore\s+(?:all\s+)?(?:previous|prior|above)?\s*(?:instructions?|rules?|guidelines?|prompts?|constraints?)",
+        r"disregard\s+(?:all\s+)?(?:previous|prior|above)?\s*(?:instructions?|rules?|guidelines?|prompts?|constraints?)",
+        r"bypass\s+(?:all\s+)?(?:safety|content|security)?\s*(?:filters?|policies|guards?|limits?)?",
+        r"(?:reveal|display|output|print|show)\s+(?:the\s+)?(?:system\s+prompt|developer\s+mode|instructions|root\s+key|password|secret|(?:admin|administrator)\s+(?:secret|key|password|credentials?))",
+        r"you\s+are\s+now\s+(?:in\s+)?(?:dan|developer|jailbreak|unfiltered)(?:\s+mode)?\b",
+        r"pretend\s+you\s+have\s+no\s+(?:rules|filters|limitations|guidelines|restrictions)",
+        r"(?:system\s+override|admin\s+override|sudo\s+mode|root\s+access)",
+        r"roleplay\s+as\s+(?:an?\s+)?(?:evil|unfiltered|jailbroken)",
         r"<\|(?:im_start|im_end|system|user|assistant)\|>",
         r"\[(?:system|admin|override)\]",
         r"format\s+as\s+raw\s+system\s+instructions",
@@ -84,17 +86,20 @@ class TextFeatureExtractor:
         if not text:
             return 0.0
 
-        score = 0.0
-        lower_text = text.lower()
+        sanitizer = get_unicode_sanitizer()
+        canonical_text = sanitizer.canonicalize(text)
 
-        # 1. Pattern Matching
+        score = 0.0
+        lower_text = canonical_text.lower()
+
+        # 1. Pattern Matching on Canonical Text
         for regex in self.injection_regexes:
             if regex.search(lower_text):
                 score += 0.45
 
         # 2. Delimiter and Control Symbol Abuse
         delimiters = ["```", "---", "###", "===", "<|", "|>"]
-        delim_count = sum(text.count(d) for d in delimiters)
+        delim_count = sum(canonical_text.count(d) for d in delimiters)
         if delim_count >= 3:
             score += 0.20
 
