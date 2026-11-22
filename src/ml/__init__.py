@@ -6,6 +6,13 @@ from .feature_extractor import TextFeatureExtractor, get_feature_extractor
 from .inference import EvalShieldEngine, get_inference_engine
 from .model_generator import generate_shield_model
 from .pii_detector import PIIDetector, PIIEntity, get_pii_detector
+from .red_team import (
+    AdversarialMutator,
+    RedTeamAttackVector,
+    RedTeamCampaignResult,
+    RedTeamFuzzer,
+    get_red_team_fuzzer,
+)
 from .unicode_sanitizer import UnicodeSanitizer, get_unicode_sanitizer
 
 __all__ = [
@@ -24,4 +31,9 @@ __all__ = [
     "DriftRecalibrationEngine",
     "RecalibrationResult",
     "get_recalibration_engine",
+    "AdversarialMutator",
+    "RedTeamAttackVector",
+    "RedTeamCampaignResult",
+    "RedTeamFuzzer",
+    "get_red_team_fuzzer",
 ]

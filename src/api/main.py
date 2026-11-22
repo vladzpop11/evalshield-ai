@@ -47,6 +47,9 @@ from src.api.schemas import (
     ModelMetadataResponse,
     RecalibrateRequest,
     RecalibrateResponse,
+    RedTeamMutationsResponse,
+    RedTeamSimulateRequest,
+    RedTeamSimulateResponse,
     ShadowStatsResponse,
 )
 from src.ml.champion_challenger import ChampionChallengerRouter, get_champion_challenger_router
@@ -54,6 +57,7 @@ from src.ml.drift_recalibration import DriftRecalibrationEngine, get_recalibrati
 from src.ml.feature_extractor import TextFeatureExtractor, get_feature_extractor
 from src.ml.inference import EvalShieldEngine, get_inference_engine
 from src.ml.pii_detector import PIIDetector, get_pii_detector
+from src.ml.red_team import RedTeamFuzzer, get_red_team_fuzzer
 from src.ml.unicode_sanitizer import UnicodeSanitizer, get_unicode_sanitizer
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
@@ -716,3 +720,36 @@ async def trigger_drift_recalibration(request: RecalibrateRequest) -> Recalibrat
         significance_level=request.significance_level,
     )
     return RecalibrateResponse(**result.to_dict())
+
+
+@app.post("/red-team/simulate", response_model=RedTeamSimulateResponse, tags=["Red Team"])
+async def simulate_red_team_campaign(
+    request: RedTeamSimulateRequest,
+    response: Response,
+) -> RedTeamSimulateResponse:
+    """Execute an automated genetic adversarial red-teaming campaign against the shield."""
+    fuzzer = get_red_team_fuzzer()
+    campaign_res = fuzzer.run_campaign(
+        seed_prompt=request.seed_prompt,
+        rounds=request.rounds,
+        allowed_types=request.mutation_types,
+        trigger_recalibration=request.trigger_recalibration,
+    )
+    # Inject tamper-proof cryptographic receipt header
+    response.headers["X-Shield-Signature"] = campaign_res.cryptographic_receipt
+    return RedTeamSimulateResponse(**campaign_res.to_dict())
+
+
+@app.get("/red-team/mutations", response_model=RedTeamMutationsResponse, tags=["Red Team"])
+async def list_red_team_mutations() -> RedTeamMutationsResponse:
+    """List available genetic mutation operators and their adversarial mechanisms."""
+    return RedTeamMutationsResponse(
+        available_mutations={
+            "leet_speak": "Substitutes vowels and alphanumeric characters with phonetic symbols and digits",
+            "payload_split": "Inserts hyphens or spaces into sensitive tokens to evade exact-match boundary filters",
+            "base64_wrap": "Encodes adversarial payload into Base64 format inside an execution wrapper",
+            "roleplay_frame": "Wraps prompt inside complex fictional screenplays or cognitive dissonance frames",
+            "hypothetical": "Pretends prompt is an academic inquiry, theoretical exercise, or ethical audit",
+            "delimiter_injection": "Prepends raw LLM system context delimiters to hijack instruction hierarchy",
+        }
+    )

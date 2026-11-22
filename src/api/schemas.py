@@ -230,3 +230,49 @@ class ComplianceReportResponse(BaseModel):
     human_oversight_and_shadow_telemetry: Dict[str, Any]
     compliance_status: Literal["COMPLIANT", "PROVISIONALLY_COMPLIANT", "NON_COMPLIANT"]
 
+
+class RedTeamSimulateRequest(BaseModel):
+    """Configuration for an automated adversarial red-team campaign."""
+    seed_prompt: str = Field(..., min_length=3, max_length=1000, description="Base adversarial seed prompt to mutate")
+    rounds: int = Field(default=10, ge=1, le=50, description="Number of mutated variations to test")
+    mutation_types: Optional[List[str]] = Field(
+        default=None,
+        description="Selective mutation operators (leet_speak, payload_split, base64_wrap, roleplay_frame, hypothetical, delimiter_injection)",
+    )
+    trigger_recalibration: bool = Field(
+        default=True,
+        description="Whether to trigger closed-loop drift recalibration if evasions are discovered",
+    )
+
+
+class RedTeamAttackVectorSchema(BaseModel):
+    """Individual attack attempt data in red-team simulation."""
+    vector_id: str
+    mutation_type: str
+    original_prompt: str
+    mutated_prompt: str
+    shield_decision: str
+    risk_score: float
+    evasion_succeeded: bool
+    violation_reasons: List[str]
+    latency_ms: float
+
+
+class RedTeamSimulateResponse(BaseModel):
+    """Detailed outcome and cryptographic verification of red-team campaign."""
+    campaign_id: str
+    seed_prompt: str
+    total_mutations: int
+    evasion_count: int
+    attack_success_rate: float = Field(..., ge=0.0, le=1.0)
+    attack_vectors: List[RedTeamAttackVectorSchema]
+    discovered_bypasses: List[RedTeamAttackVectorSchema]
+    cryptographic_receipt: str
+    recalibration_triggered: bool
+    completed_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+class RedTeamMutationsResponse(BaseModel):
+    """Available genetic mutation strategies and descriptions."""
+    available_mutations: Dict[str, str]
+

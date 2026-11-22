@@ -168,3 +168,52 @@ class EvalShieldClient:
                 return res.status_code == 200 and res.json().get("status") == "healthy"
         except Exception:
             return False
+
+    def simulate_red_team(
+        self,
+        seed_prompt: str,
+        rounds: int = 10,
+        mutation_types: Optional[List[str]] = None,
+        trigger_recalibration: bool = True,
+    ) -> Dict[str, Any]:
+        """Execute an automated adversarial red-team campaign synchronously."""
+        payload = {
+            "seed_prompt": seed_prompt,
+            "rounds": rounds,
+            "mutation_types": mutation_types,
+            "trigger_recalibration": trigger_recalibration,
+        }
+        if self.app is not None:
+            from starlette.testclient import TestClient
+            with TestClient(self.app, base_url=self.base_url) as client:
+                res = client.post("/red-team/simulate", json=payload)
+                if res.status_code != 200:
+                    raise EvalShieldException(f"Red-team simulation failed ({res.status_code}): {res.text}")
+                return res.json()
+
+        with httpx.Client(base_url=self.base_url, timeout=self.timeout) as client:
+            res = client.post("/red-team/simulate", json=payload)
+            if res.status_code != 200:
+                raise EvalShieldException(f"Red-team simulation failed ({res.status_code}): {res.text}")
+            return res.json()
+
+    async def async_simulate_red_team(
+        self,
+        seed_prompt: str,
+        rounds: int = 10,
+        mutation_types: Optional[List[str]] = None,
+        trigger_recalibration: bool = True,
+    ) -> Dict[str, Any]:
+        """Execute an automated adversarial red-team campaign asynchronously."""
+        payload = {
+            "seed_prompt": seed_prompt,
+            "rounds": rounds,
+            "mutation_types": mutation_types,
+            "trigger_recalibration": trigger_recalibration,
+        }
+        transport = self._get_async_transport()
+        async with httpx.AsyncClient(base_url=self.base_url, transport=transport, timeout=self.timeout) as client:
+            res = await client.post("/red-team/simulate", json=payload)
+            if res.status_code != 200:
+                raise EvalShieldException(f"Red-team simulation failed ({res.status_code}): {res.text}")
+            return res.json()
