@@ -10,6 +10,7 @@ without service downtime.
 from __future__ import annotations
 
 import logging
+import threading
 import uuid
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -141,11 +142,14 @@ class DriftRecalibrationEngine:
 
 
 _engine_instance: Optional[DriftRecalibrationEngine] = None
+_engine_lock = threading.Lock()
 
 
 def get_recalibration_engine() -> DriftRecalibrationEngine:
     """Thread-safe singleton getter for DriftRecalibrationEngine."""
     global _engine_instance
     if _engine_instance is None:
-        _engine_instance = DriftRecalibrationEngine()
+        with _engine_lock:
+            if _engine_instance is None:
+                _engine_instance = DriftRecalibrationEngine()
     return _engine_instance

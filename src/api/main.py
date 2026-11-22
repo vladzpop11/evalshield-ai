@@ -486,6 +486,63 @@ async def prometheus_metrics() -> Response:
     )
 
 
+def _evaluate_interaction(payload: EvaluationRequest) -> Tuple[Dict[str, Any], str]:
+    """Execute complete unified evaluation pipeline: feature extraction, inference, PII, canary, and attribution."""
+    features, extraction_mode = _resolve_features(payload)
+    result = _cached_predict(features, prompt_id=payload.prompt_id)
+    result["prompt_id"] = payload.prompt_id
+    result["extraction_mode"] = extraction_mode
+
+    # 1. Compute explainable risk contributions (sums to 1.0)
+    result["risk_contributions"] = _calculate_risk_contributions(features)
+
+    # 2. Sensitive PII & Secret scanning / redaction
+    pii_detector = get_pii()
+    sanitized_text: Optional[str] = None
+    pii_entities_list: List[Dict[str, Any]] = []
+
+    if payload.prompt_text:
+        if payload.redact_pii:
+            sanitized_text, entities = pii_detector.redact_pii(payload.prompt_text)
+            pii_entities_list = [e.to_dict() for e in entities]
+        else:
+            entities = pii_detector.detect_pii(payload.prompt_text)
+            pii_entities_list = [e.to_dict() for e in entities]
+
+    if payload.response_text:
+        resp_entities = pii_detector.detect_pii(payload.response_text)
+        for re_item in resp_entities:
+            pii_entities_list.append(re_item.to_dict())
+
+    result["sanitized_prompt"] = sanitized_text
+    result["pii_detected"] = pii_entities_list
+
+    # 3. System prompt canary honeytoken leak detection
+    result["canary_leak_detected"] = False
+    result["leaked_canary_token"] = None
+    if payload.canary_tokens and payload.response_text:
+        sanitizer = get_unicode_sanitizer()
+        is_leaked, leaked_token = sanitizer.check_canary_leak(payload.response_text, payload.canary_tokens)
+        if is_leaked:
+            result["shield_decision"] = "BLOCKED"
+            result["risk_score"] = 1.0
+            result["confidence"] = 1.0
+            result["canary_leak_detected"] = True
+            result["leaked_canary_token"] = leaked_token
+            reasons = list(result.get("violation_reasons", []))
+            reasons.append(
+                f"CRITICAL: System prompt canary honeytoken leaked in model output ({leaked_token})"
+            )
+            result["violation_reasons"] = reasons
+
+    if pii_entities_list:
+        global _telemetry_pii_detected
+        with _telemetry_lock:
+            _telemetry_pii_detected += len(pii_entities_list)
+
+    return result, extraction_mode
+
+
 @app.post("/evaluate", response_model=EvaluationResponse, tags=["Inference"])
 async def evaluate_single(payload: EvaluationRequest) -> EvaluationResponse:
     """Evaluate one AI interaction.
@@ -499,57 +556,7 @@ async def evaluate_single(payload: EvaluationRequest) -> EvaluationResponse:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Model engine not loaded")
 
     try:
-        features, extraction_mode = _resolve_features(payload)
-        result = _cached_predict(features, prompt_id=payload.prompt_id)
-        result["prompt_id"] = payload.prompt_id
-        result["extraction_mode"] = extraction_mode
-
-        # 1. Compute explainable risk contributions (sums to 1.0)
-        result["risk_contributions"] = _calculate_risk_contributions(features)
-
-        # 2. Sensitive PII & Secret scanning / redaction
-        pii_detector = get_pii()
-        sanitized_text: Optional[str] = None
-        pii_entities_list: List[Dict[str, Any]] = []
-
-        if payload.prompt_text:
-            if payload.redact_pii:
-                sanitized_text, entities = pii_detector.redact_pii(payload.prompt_text)
-                pii_entities_list = [e.to_dict() for e in entities]
-            else:
-                entities = pii_detector.detect_pii(payload.prompt_text)
-                pii_entities_list = [e.to_dict() for e in entities]
-
-            if payload.response_text:
-                resp_entities = pii_detector.detect_pii(payload.response_text)
-                for re_item in resp_entities:
-                    pii_entities_list.append(re_item.to_dict())
-
-        result["sanitized_prompt"] = sanitized_text
-        result["pii_detected"] = pii_entities_list
-
-        # 3. System prompt canary honeytoken leak detection
-        result["canary_leak_detected"] = False
-        result["leaked_canary_token"] = None
-        if payload.canary_tokens and payload.response_text:
-            sanitizer = get_unicode_sanitizer()
-            is_leaked, leaked_token = sanitizer.check_canary_leak(payload.response_text, payload.canary_tokens)
-            if is_leaked:
-                result["shield_decision"] = "BLOCKED"
-                result["risk_score"] = 1.0
-                result["confidence"] = 1.0
-                result["canary_leak_detected"] = True
-                result["leaked_canary_token"] = leaked_token
-                reasons = list(result.get("violation_reasons", []))
-                reasons.append(
-                    f"CRITICAL: System prompt canary honeytoken leaked in model output ({leaked_token})"
-                )
-                result["violation_reasons"] = reasons
-
-        if pii_entities_list:
-            global _telemetry_pii_detected
-            with _telemetry_lock:
-                _telemetry_pii_detected += len(pii_entities_list)
+        result, extraction_mode = _evaluate_interaction(payload)
 
         # Track telemetry
         _record_telemetry(
@@ -588,17 +595,16 @@ async def evaluate_streaming(payload: EvaluationRequest) -> StreamingResponse:
         await asyncio.sleep(0.01)
 
         # Event 3: Evaluation Verdict
-        features, extraction_mode = _resolve_features(payload)
-        res = _cached_predict(features, prompt_id=payload.prompt_id)
-        contributions = _calculate_risk_contributions(features)
+        res, extraction_mode = _evaluate_interaction(payload)
 
         verdict_payload = {
             "shield_decision": res["shield_decision"],
             "risk_score": res["risk_score"],
             "confidence": res["confidence"],
-            "risk_contributions": contributions,
+            "risk_contributions": res.get("risk_contributions", {}),
             "category_scores": res["category_scores"],
             "violation_reasons": res.get("violation_reasons", []),
+            "canary_leak_detected": res.get("canary_leak_detected", False),
             "action": "ABORT_STREAM" if res["shield_decision"] == "BLOCKED" else "CONTINUE",
         }
         yield f"event: verdict\ndata: {json.dumps(verdict_payload)}\n\n"
@@ -620,29 +626,10 @@ async def evaluate_batch(batch: BatchEvaluationRequest) -> BatchEvaluationRespon
     t_start = time.perf_counter()
     results: List[EvaluationResponse] = []
     allowed = flagged = blocked = 0
-    pii_detector = get_pii()
 
     for item in batch.items:
-        features, extraction_mode = _resolve_features(item)
-        pred = _cached_predict(features, prompt_id=item.prompt_id)
-        pred["prompt_id"] = item.prompt_id
-        pred["extraction_mode"] = extraction_mode
-        pred["risk_contributions"] = _calculate_risk_contributions(features)
-
-        # PII Detection for batch items
-        if item.prompt_text:
-            if item.redact_pii:
-                sanitized, entities = pii_detector.redact_pii(item.prompt_text)
-                pred["sanitized_prompt"] = sanitized
-                pred["pii_detected"] = [e.to_dict() for e in entities]
-            else:
-                pred["sanitized_prompt"] = None
-                pred["pii_detected"] = [e.to_dict() for e in pii_detector.detect_pii(item.prompt_text)]
-        else:
-            pred["sanitized_prompt"] = None
-            pred["pii_detected"] = []
-
-        res = EvaluationResponse(**pred)
+        result, extraction_mode = _evaluate_interaction(item)
+        res = EvaluationResponse(**result)
         results.append(res)
 
         _record_telemetry(
@@ -657,6 +644,16 @@ async def evaluate_batch(batch: BatchEvaluationRequest) -> BatchEvaluationRespon
             flagged += 1
         else:
             blocked += 1
+
+    batch_latency = (time.perf_counter() - t_start) * 1000.0
+    return BatchEvaluationResponse(
+        results=results,
+        total_evaluated=len(results),
+        allowed_count=allowed,
+        flagged_count=flagged,
+        blocked_count=blocked,
+        batch_latency_ms=round(batch_latency, 2),
+    )
 
     return BatchEvaluationResponse(
         results=results,
