@@ -247,6 +247,33 @@ uvicorn src.api.main:app --host 0.0.0.0 --port 8000 --reload
 - NIST & EU AI Act Report: [http://localhost:8000/model/compliance-report](http://localhost:8000/model/compliance-report)
 - Shadow Router Telemetry: [http://localhost:8000/model/shadow-stats](http://localhost:8000/model/shadow-stats)
 
+### API Authentication Modes
+
+The API reads these environment variables when the application is imported:
+
+- `EVALSHIELD_MODE=demo` (default) keeps the local/demo API anonymous when no API key is configured.
+- `EVALSHIELD_MODE=production` requires `EVALSHIELD_API_KEY` and rejects startup if it is missing or invalid. Keys must contain at least 32 non-whitespace ASCII characters.
+- Setting `EVALSHIELD_API_KEY` in demo mode also enables authentication. Configure the environment before starting Uvicorn.
+
+Only `GET /health` remains public. All other API operations require `Authorization: Bearer <token>`. Swagger, ReDoc, and OpenAPI routes are available only when authentication is disabled (the default demo setup).
+
+Generate a deployment key outside the repository and provide it through your secret manager or environment:
+
+```bash
+export EVALSHIELD_MODE=production
+export EVALSHIELD_API_KEY="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"
+uvicorn src.api.main:app --host 0.0.0.0 --port 8000
+```
+
+The Python SDK accepts the same key without changing existing unauthenticated demo calls:
+
+```python
+import os
+from src.sdk import EvalShieldClient
+
+client = EvalShieldClient(api_key=os.environ.get("EVALSHIELD_API_KEY"))
+```
+
 ### Step 4: Open the Web UI Dashboard
 
 Serve the static dashboard:

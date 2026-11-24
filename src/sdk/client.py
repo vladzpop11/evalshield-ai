@@ -49,10 +49,18 @@ class EvalShieldClient:
         base_url: str = "http://localhost:8000",
         timeout: float = 5.0,
         app: Optional[Any] = None,
+        api_key: Optional[str] = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
         self.app = app  # Allows passing FastAPI app directly for testing via ASGITransport
+        self._api_key = api_key
+
+    def _auth_headers(self) -> Dict[str, str]:
+        """Return authentication headers without logging or formatting the key elsewhere."""
+        if self._api_key is None:
+            return {}
+        return {"Authorization": f"Bearer {self._api_key}"}
 
     def _get_async_transport(self) -> Optional[httpx.BaseTransport]:
         if self.app is not None:
@@ -97,7 +105,7 @@ class EvalShieldClient:
         if self.app is not None:
             from starlette.testclient import TestClient
             with TestClient(self.app, base_url=self.base_url) as client:
-                resp = client.post("/evaluate", json=payload)
+                resp = client.post("/evaluate", json=payload, headers=self._auth_headers())
                 if resp.status_code != 200:
                     raise EvalShieldException(
                         f"EvalShield API request failed ({resp.status_code})."
@@ -105,7 +113,7 @@ class EvalShieldClient:
                 return resp.json()
 
         with httpx.Client(base_url=self.base_url, timeout=self.timeout) as client:
-            resp = client.post("/evaluate", json=payload)
+            resp = client.post("/evaluate", json=payload, headers=self._auth_headers())
             if resp.status_code != 200:
                 raise EvalShieldException(
                     f"EvalShield API request failed ({resp.status_code})."
@@ -149,7 +157,7 @@ class EvalShieldClient:
 
         transport = self._get_async_transport()
         async with httpx.AsyncClient(base_url=self.base_url, transport=transport, timeout=self.timeout) as client:
-            resp = await client.post("/evaluate", json=payload)
+            resp = await client.post("/evaluate", json=payload, headers=self._auth_headers())
             if resp.status_code != 200:
                 raise EvalShieldException(
                     f"EvalShield API request failed ({resp.status_code})."
@@ -162,11 +170,11 @@ class EvalShieldClient:
             if self.app is not None:
                 from starlette.testclient import TestClient
                 with TestClient(self.app, base_url=self.base_url) as client:
-                    res = client.get("/health")
+                    res = client.get("/health", headers=self._auth_headers())
                     return res.status_code == 200 and res.json().get("status") == "healthy"
 
             with httpx.Client(base_url=self.base_url, timeout=self.timeout) as client:
-                res = client.get("/health")
+                res = client.get("/health", headers=self._auth_headers())
                 return res.status_code == 200 and res.json().get("status") == "healthy"
         except Exception:
             return False
@@ -188,13 +196,13 @@ class EvalShieldClient:
         if self.app is not None:
             from starlette.testclient import TestClient
             with TestClient(self.app, base_url=self.base_url) as client:
-                res = client.post("/red-team/simulate", json=payload)
+                res = client.post("/red-team/simulate", json=payload, headers=self._auth_headers())
                 if res.status_code != 200:
                     raise EvalShieldException(f"Red-team simulation failed ({res.status_code}).")
                 return res.json()
 
         with httpx.Client(base_url=self.base_url, timeout=self.timeout) as client:
-            res = client.post("/red-team/simulate", json=payload)
+            res = client.post("/red-team/simulate", json=payload, headers=self._auth_headers())
             if res.status_code != 200:
                 raise EvalShieldException(f"Red-team simulation failed ({res.status_code}).")
             return res.json()
@@ -215,7 +223,7 @@ class EvalShieldClient:
         }
         transport = self._get_async_transport()
         async with httpx.AsyncClient(base_url=self.base_url, transport=transport, timeout=self.timeout) as client:
-            res = await client.post("/red-team/simulate", json=payload)
+            res = await client.post("/red-team/simulate", json=payload, headers=self._auth_headers())
             if res.status_code != 200:
                 raise EvalShieldException(f"Red-team simulation failed ({res.status_code}).")
             return res.json()

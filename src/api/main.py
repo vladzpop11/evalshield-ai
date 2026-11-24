@@ -29,7 +29,7 @@ from typing import Any, AsyncGenerator, Deque, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-from fastapi import FastAPI, HTTPException, Request, Response, status
+from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -53,6 +53,7 @@ from src.api.schemas import (
     RedTeamSimulateResponse,
     ShadowStatsResponse,
 )
+from src.api.security import APIAuthConfig, documentation_urls, require_api_auth
 from src.ml.champion_challenger import ChampionChallengerRouter, get_champion_challenger_router
 from src.ml.drift_recalibration import DriftRecalibrationEngine, get_recalibration_engine
 from src.ml.feature_extractor import TextFeatureExtractor, get_feature_extractor
@@ -70,6 +71,7 @@ _baseline_df: pd.DataFrame | None = None
 _extractor: TextFeatureExtractor | None = None
 _router: ChampionChallengerRouter | None = None
 _pii_detector: PIIDetector | None = None
+_api_auth_config = APIAuthConfig.from_env()
 
 # Thread-safe LRU evaluation cache (up to 512 recent decisions)
 _eval_cache: OrderedDict[str, dict] = OrderedDict()
@@ -239,6 +241,12 @@ def _record_telemetry(decision: str, mode: str, latency_ms: float) -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Startup: warm all singletons before accepting traffic."""
+    # Fail before loading models or serving requests when production security
+    # configuration is absent or invalid.
+    auth_config: APIAuthConfig = getattr(app.state, "api_auth_config", _api_auth_config)
+    auth_config.validate()
+    app.state.api_auth_config = auth_config
+
     logger.info("Starting EvalShield-AI engine warm-up...")
     get_engine()
     get_router()
@@ -258,7 +266,10 @@ app = FastAPI(
     ),
     version="1.3.0",
     lifespan=lifespan,
+    dependencies=[Depends(require_api_auth)],
+    **documentation_urls(_api_auth_config),
 )
+app.state.api_auth_config = _api_auth_config
 
 app.add_middleware(
     CORSMiddleware,
@@ -279,7 +290,18 @@ async def safe_validation_error(request: Request, exc: RequestValidationError) -
 async def add_timing_and_security_headers(request: Request, call_next) -> Response:
     """Inject timing and hardened security headers into every response."""
     t0 = time.perf_counter()
-    response = await call_next(request)
+    auth_config: APIAuthConfig = getattr(request.app.state, "api_auth_config", _api_auth_config)
+    if auth_config.authentication_enabled and request.url.path in {
+        "/docs",
+        "/redoc",
+        "/openapi.json",
+    }:
+        # These Starlette routes are not covered by FastAPI's operation
+        # dependencies. Hide them according to the active runtime policy too,
+        # including when that policy was supplied through app.state at startup.
+        response = JSONResponse(status_code=404, content={"detail": "Not Found"})
+    else:
+        response = await call_next(request)
     response.headers["X-Process-Time-Ms"] = f"{(time.perf_counter() - t0) * 1000.0:.2f}"
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"

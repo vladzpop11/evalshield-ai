@@ -23,8 +23,9 @@ class EvalShieldGuard:
         redact_pii: bool = False,
         canary_tokens: Optional[List[str]] = None,
         app: Optional[Any] = None,
+        api_key: Optional[str] = None,
     ) -> None:
-        self.client = client or EvalShieldClient(base_url=base_url, app=app)
+        self.client = client or EvalShieldClient(base_url=base_url, app=app, api_key=api_key)
         self.redact_pii = redact_pii
         self.canary_tokens = canary_tokens
 
