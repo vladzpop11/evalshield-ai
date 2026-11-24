@@ -68,9 +68,10 @@ class EvalShieldGuard:
                 # Output Guardrail Inspection
                 if inspect_output and isinstance(llm_output, str):
                     out_res = await self.client.async_evaluate(
-                        prompt_text=prompt_text,
+                        prompt_text=eval_res.get("sanitized_prompt") or prompt_text,
                         response_text=llm_output,
                         canary_tokens=self.canary_tokens,
+                        redact_pii=self.redact_pii,
                     )
                     if out_res.get("shield_decision") == "BLOCKED":
                         if on_blocked == "raise":
@@ -110,9 +111,10 @@ class EvalShieldGuard:
 
                 if inspect_output and isinstance(llm_output, str):
                     out_res = self.client.evaluate(
-                        prompt_text=prompt_text,
+                        prompt_text=eval_res.get("sanitized_prompt") or prompt_text,
                         response_text=llm_output,
                         canary_tokens=self.canary_tokens,
+                        redact_pii=self.redact_pii,
                     )
                     if out_res.get("shield_decision") == "BLOCKED":
                         if on_blocked == "raise":

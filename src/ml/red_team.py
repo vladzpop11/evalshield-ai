@@ -22,19 +22,115 @@ import logging
 import random
 import re
 import uuid
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass, fields, is_dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from .drift_recalibration import DriftRecalibrationEngine, get_recalibration_engine
 from .feature_extractor import TextFeatureExtractor, get_feature_extractor
 from .inference import EvalShieldEngine, get_inference_engine
+from .pii_detector import get_pii_detector
 from .unicode_sanitizer import UnicodeSanitizer, get_unicode_sanitizer
 
 logger = logging.getLogger("evalshield_redteam")
 
 # Default secret salt for tamper-proof cryptographic audit receipts
 _AUDIT_SALT = b"evalshield-redshield-audit-v1.3"
+
+
+def _sanitize_prompt(text: str) -> str:
+    """Remove recognized PII before prompts enter campaign objects or outputs."""
+    return get_pii_detector().redact_pii(text)[0]
+
+
+def _sanitize_nested(value: Any) -> Any:
+    """Recursively sanitize values stored in public red-team result structures."""
+    if isinstance(value, str):
+        return _sanitize_prompt(value)
+    if isinstance(value, (_SafePIIList, _SafePIIDict)):
+        return value
+    if isinstance(value, list):
+        return _SafePIIList(value)
+    if isinstance(value, dict):
+        return _SafePIIDict(value)
+    if isinstance(value, tuple):
+        return tuple(_sanitize_nested(item) for item in value)
+    if is_dataclass(value) and not isinstance(value, type):
+        if type(value).__name__ in {"RedTeamAttackVector", "RedTeamCampaignResult"}:
+            return value
+        return _SafePIIDict((item.name, getattr(value, item.name)) for item in fields(value))
+    if hasattr(value, "__dict__"):
+        return _SafePIIDict(vars(value))
+    return value
+
+
+def _serialize_public(value: Any) -> Any:
+    """Convert result objects to safe primitive containers at public boundaries."""
+    if isinstance(value, str):
+        return _sanitize_prompt(value)
+    if is_dataclass(value) and not isinstance(value, type):
+        return {item.name: _serialize_public(getattr(value, item.name)) for item in fields(value)}
+    if isinstance(value, dict):
+        return {_serialize_public(key): _serialize_public(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_serialize_public(item) for item in value]
+    if hasattr(value, "__dict__"):
+        return _serialize_public(vars(value))
+    return value
+
+
+class _SafePIIList(list):
+    """List preserving normal list behavior while sanitizing every insertion."""
+
+    def __init__(self, values=()):
+        super().__init__()
+        self.extend(values)
+
+    def append(self, value: Any) -> None:
+        super().append(_sanitize_nested(value))
+
+    def extend(self, values) -> None:
+        super().extend(_sanitize_nested(value) for value in values)
+
+    def insert(self, index: int, value: Any) -> None:
+        super().insert(index, _sanitize_nested(value))
+
+    def __setitem__(self, index, value) -> None:
+        if isinstance(index, slice):
+            value = [_sanitize_nested(item) for item in value]
+        else:
+            value = _sanitize_nested(value)
+        super().__setitem__(index, value)
+
+    def __iadd__(self, values):
+        self.extend(values)
+        return self
+
+
+class _SafePIIDict(dict):
+    """Dictionary preserving mapping behavior while sanitizing nested values."""
+
+    def __init__(self, values=(), **kwargs):
+        super().__init__()
+        self.update(values, **kwargs)
+
+    def __setitem__(self, key: Any, value: Any) -> None:
+        safe_key = _sanitize_nested(key)
+        super().__setitem__(safe_key, _sanitize_nested(value))
+
+    def update(self, values=(), **kwargs) -> None:
+        incoming = dict(values, **kwargs)
+        for key, value in incoming.items():
+            self[key] = value
+
+    def setdefault(self, key: Any, default: Any = None) -> Any:
+        if key not in self:
+            self[key] = default
+        return self[key]
+
+    def __ior__(self, values):
+        self.update(values)
+        return self
 
 
 @dataclass
@@ -50,8 +146,17 @@ class RedTeamAttackVector:
     violation_reasons: List[str]
     latency_ms: float
 
+    def __setattr__(self, name: str, value: Any) -> None:
+        # Keep public dataclass fields safe as well as to_dict()/asdict output,
+        # including after ordinary post-construction field updates.
+        if name in {"original_prompt", "mutated_prompt"}:
+            value = _sanitize_prompt(value)
+        elif name == "violation_reasons":
+            value = _SafePIIList(value)
+        object.__setattr__(self, name, value)
+
     def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+        return _serialize_public(self)
 
 
 @dataclass
@@ -68,11 +173,15 @@ class RedTeamCampaignResult:
     recalibration_triggered: bool
     completed_at: str
 
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name == "seed_prompt":
+            value = _sanitize_prompt(value)
+        elif name in {"attack_vectors", "discovered_bypasses"}:
+            value = _SafePIIList(value)
+        object.__setattr__(self, name, value)
+
     def to_dict(self) -> Dict[str, Any]:
-        data = asdict(self)
-        data["attack_vectors"] = [v.to_dict() if hasattr(v, "to_dict") else v for v in self.attack_vectors]
-        data["discovered_bypasses"] = [v.to_dict() if hasattr(v, "to_dict") else v for v in self.discovered_bypasses]
-        return data
+        return _serialize_public(self)
 
 
 class AdversarialMutator:
@@ -219,6 +328,9 @@ class RedTeamFuzzer:
         trigger_recalibration: bool = True,
     ) -> RedTeamCampaignResult:
         """Execute a full multi-round red-team mutation campaign against the guardrail."""
+        # Sanitize before mutation and feature extraction so neither downstream
+        # processing nor result objects retain the caller's detected PII.
+        seed_prompt = _sanitize_prompt(seed_prompt)
         campaign_id = f"rtc-{uuid.uuid4().hex[:8]}"
         mutations = self.mutator.generate_mutations(seed_prompt, rounds=rounds, allowed_types=allowed_types)
 

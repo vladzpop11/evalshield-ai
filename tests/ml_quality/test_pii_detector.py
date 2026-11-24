@@ -9,9 +9,12 @@ Validates:
 
 from __future__ import annotations
 
+import json
+from dataclasses import asdict
+
 import pytest
 
-from src.ml.pii_detector import PIIDetector, get_pii_detector
+from src.ml.pii_detector import PIIEntity, PIIDetector, get_pii_detector
 
 
 @pytest.fixture
@@ -47,7 +50,7 @@ class TestPIIDetector:
         entities = detector.detect_pii(text)
         assert len(entities) == 1
         assert entities[0].entity_type == "US_SSN"
-        assert entities[0].matched_value == "123-45-6789"
+        assert text[entities[0].start:entities[0].end] == "123-45-6789"
 
     def test_email_address_detection(self, detector: PIIDetector):
         """Corporate and personal email addresses are captured."""
@@ -55,7 +58,21 @@ class TestPIIDetector:
         entities = detector.detect_pii(text)
         assert len(entities) == 1
         assert entities[0].entity_type == "EMAIL_ADDRESS"
-        assert entities[0].matched_value == "sec-ops@enterprise-shield.corp"
+        assert text[entities[0].start:entities[0].end] == "sec-ops@enterprise-shield.corp"
+
+    def test_entity_serialization_and_repr_never_expose_matched_value(self, detector: PIIDetector):
+        secret = "private.user@example.com"
+        entity = detector.detect_pii(secret)[0]
+
+        serialized = json.dumps(entity.to_dict())
+        dataclass_serialized = json.dumps(asdict(entity))
+        assert secret not in serialized
+        assert secret not in dataclass_serialized
+        assert "matched_value" not in entity.to_dict()
+        assert secret not in repr(entity)
+        assert not hasattr(entity, "matched_value")
+        assert entity.to_dict()["entity_type"] == "EMAIL_ADDRESS"
+        assert entity.to_dict()["redacted"] is False
 
     def test_api_keys_and_secrets_detection(self, detector: PIIDetector):
         """OpenAI, AWS, GitHub, and JWT credentials trigger immediate discovery."""
@@ -93,6 +110,66 @@ class TestPIIDetector:
         assert "555-123-4567" not in sanitized
         assert "[REDACTED_EMAIL]" in sanitized
         assert "[REDACTED_PHONE]" in sanitized
+        assert entities[0].to_dict(redacted=True)["redacted"] is True
+
+    def test_overlapping_credit_card_and_phone_spans_keep_longest_detection(self, detector: PIIDetector):
+        # The 16-digit card also contains a 10-digit substring matching the
+        # phone detector. Same-start overlaps follow the existing longest-span policy.
+        card = "4532015012345671"
+        entities = detector.detect_pii(card)
+        assert [(entity.entity_type, entity.start, entity.end) for entity in entities] == [
+            ("CREDIT_CARD", 0, len(card))
+        ]
+        sanitized, redacted_entities = detector.redact_pii(card)
+        assert sanitized == "[REDACTED_CREDIT_CARD]"
+        assert len(redacted_entities) == 1
+
+    def test_crossing_spans_are_fully_redacted_without_changing_detection_policy(self):
+        class CrossingSpanDetector(PIIDetector):
+            def _detect_pii_candidates(self, text):
+                # Controlled spans [0, 6) and [3, 9): this exercises interval
+                # handling without claiming a built-in regex creates this pair.
+                return [
+                    PIIEntity("TEST_A", 0, 6, 1.0, "[REDACTED_A]"),
+                    PIIEntity("TEST_B", 3, 9, 1.0, "[REDACTED_B]"),
+                ]
+
+        crossing_detector = CrossingSpanDetector()
+        source = "ABCDEFGHIJ"
+        # Public metadata retains the established earliest-start policy.
+        assert [entity.entity_type for entity in crossing_detector.detect_pii(source)] == ["TEST_A"]
+        sanitized, entities = crossing_detector.redact_pii(source)
+        assert sanitized == "[REDACTED_A]J"
+        assert len(entities) == 1
+
+        masked, _ = crossing_detector.redact_pii(source, placeholder=False)
+        assert masked == "*********J"
+
+    def test_adjacent_spans_are_both_detected_and_redacted(self, detector: PIIDetector):
+        first_phone = "5551234567"
+        second_phone = "(555)123-4567"
+        raw = first_phone + second_phone
+        entities = detector.detect_pii(raw)
+        assert [(entity.entity_type, entity.start, entity.end) for entity in entities] == [
+            ("PHONE_NUMBER", 0, len(first_phone)),
+            ("PHONE_NUMBER", len(first_phone), len(raw)),
+        ]
+        sanitized, _ = detector.redact_pii(raw)
+        assert sanitized == "[REDACTED_PHONE][REDACTED_PHONE]"
+        assert first_phone not in sanitized
+        assert second_phone not in sanitized
+
+    def test_redact_without_placeholder_masks_each_span_length(self, detector: PIIDetector):
+        raw = "alice@example.com and 4532015012345671"
+        entities = detector.detect_pii(raw)
+        sanitized, _ = detector.redact_pii(raw, placeholder=False)
+
+        expected = raw
+        for entity in reversed(entities):
+            expected = expected[:entity.start] + ("*" * (entity.end - entity.start)) + expected[entity.end:]
+        assert sanitized == expected
+        assert "alice@example.com" not in sanitized
+        assert "4532015012345671" not in sanitized
 
     def test_clean_text_returns_unmodified(self, detector: PIIDetector):
         """Clean enterprise text without secrets remains completely untouched."""

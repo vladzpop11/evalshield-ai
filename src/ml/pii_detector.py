@@ -14,7 +14,7 @@ Fulfills EU AI Act Article 10 & NIST AI RMF Map 1.5 confidentiality requirements
 from __future__ import annotations
 
 import re
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
 
@@ -22,14 +22,24 @@ from typing import List, Optional, Tuple
 class PIIEntity:
     """Detected sensitive data entity occurrence."""
     entity_type: str
-    matched_value: str
     start: int
     end: int
     confidence: float
     masked_placeholder: str
 
-    def to_dict(self) -> dict:
-        return asdict(self)
+    def to_dict(self, *, redacted: bool = False, source: Optional[str] = None) -> dict:
+        """Return safe detection metadata without the matched sensitive value."""
+        data = {
+            "entity_type": self.entity_type,
+            "start": self.start,
+            "end": self.end,
+            "confidence": self.confidence,
+            "masked_placeholder": self.masked_placeholder,
+            "redacted": redacted,
+        }
+        if source is not None:
+            data["source"] = source
+        return data
 
 
 class PIIDetector:
@@ -79,8 +89,8 @@ class PIIDetector:
                 checksum += digit
         return checksum % 10 == 0
 
-    def detect_pii(self, text: str) -> List[PIIEntity]:
-        """Scan text and return all detected PII entities sorted by occurrence."""
+    def _detect_pii_candidates(self, text: str) -> List[PIIEntity]:
+        """Return all raw detector spans in deterministic start/longest-first order."""
         if not text:
             return []
 
@@ -91,7 +101,6 @@ class PIIDetector:
             entities.append(
                 PIIEntity(
                     entity_type="API_KEY_OPENAI",
-                    matched_value=match.group(),
                     start=match.start(),
                     end=match.end(),
                     confidence=1.0,
@@ -103,7 +112,6 @@ class PIIDetector:
             entities.append(
                 PIIEntity(
                     entity_type="API_KEY_AWS",
-                    matched_value=match.group(),
                     start=match.start(),
                     end=match.end(),
                     confidence=1.0,
@@ -115,7 +123,6 @@ class PIIDetector:
             entities.append(
                 PIIEntity(
                     entity_type="TOKEN_GITHUB",
-                    matched_value=match.group(),
                     start=match.start(),
                     end=match.end(),
                     confidence=1.0,
@@ -127,7 +134,6 @@ class PIIDetector:
             entities.append(
                 PIIEntity(
                     entity_type="TOKEN_JWT",
-                    matched_value=match.group(),
                     start=match.start(),
                     end=match.end(),
                     confidence=0.98,
@@ -140,7 +146,6 @@ class PIIDetector:
             entities.append(
                 PIIEntity(
                     entity_type="EMAIL_ADDRESS",
-                    matched_value=match.group(),
                     start=match.start(),
                     end=match.end(),
                     confidence=0.99,
@@ -153,7 +158,6 @@ class PIIDetector:
             entities.append(
                 PIIEntity(
                     entity_type="US_SSN",
-                    matched_value=match.group(),
                     start=match.start(),
                     end=match.end(),
                     confidence=0.95,
@@ -169,7 +173,6 @@ class PIIDetector:
                 entities.append(
                     PIIEntity(
                         entity_type="CREDIT_CARD",
-                        matched_value=raw_val,
                         start=match.start(),
                         end=match.end(),
                         confidence=0.99,
@@ -185,7 +188,6 @@ class PIIDetector:
                 entities.append(
                     PIIEntity(
                         entity_type="PHONE_NUMBER",
-                        matched_value=raw,
                         start=match.start(),
                         end=match.end(),
                         confidence=0.90,
@@ -200,7 +202,6 @@ class PIIDetector:
                 entities.append(
                     PIIEntity(
                         entity_type="IP_ADDRESS_V4",
-                        matched_value=val,
                         start=match.start(),
                         end=match.end(),
                         confidence=0.92,
@@ -213,7 +214,6 @@ class PIIDetector:
             entities.append(
                 PIIEntity(
                     entity_type="IP_ADDRESS_V6",
-                    matched_value=match.group(),
                     start=match.start(),
                     end=match.end(),
                     confidence=0.95,
@@ -221,8 +221,15 @@ class PIIDetector:
                 )
             )
 
-        # Sort by start index and eliminate overlapping entities
+        # Preserve every recognized span for complete redaction. Public
+        # detection still applies the existing non-overlap reporting policy.
         entities.sort(key=lambda e: (e.start, -e.end))
+
+        return entities
+
+    @staticmethod
+    def _deduplicate_entities(entities: List[PIIEntity]) -> List[PIIEntity]:
+        """Apply the established earliest-start, longest-at-same-start policy."""
         deduped: List[PIIEntity] = []
         last_end = -1
         for e in entities:
@@ -232,25 +239,42 @@ class PIIDetector:
 
         return deduped
 
+    def detect_pii(self, text: str) -> List[PIIEntity]:
+        """Scan text and report non-overlapping detections in occurrence order."""
+        return self._deduplicate_entities(self._detect_pii_candidates(text))
+
     def redact_pii(
         self,
         text: str,
         placeholder: bool = True,
     ) -> Tuple[str, List[PIIEntity]]:
         """Redact detected PII entities and return (sanitized_text, detected_entities)."""
-        entities = self.detect_pii(text)
-        if not entities:
+        candidates = self._detect_pii_candidates(text)
+        entities = self._deduplicate_entities(candidates)
+        if not candidates:
             return text, []
+
+        # Merge overlapping intervals for redaction only. This preserves the
+        # existing public detection policy while ensuring a crossing span's
+        # suffix cannot survive just because that span was omitted from the
+        # non-overlapping metadata list.
+        merged_spans: List[Tuple[int, int, PIIEntity]] = []
+        for entity in candidates:
+            if merged_spans and entity.start < merged_spans[-1][1]:
+                start, end, representative = merged_spans[-1]
+                merged_spans[-1] = (start, max(end, entity.end), representative)
+            else:
+                merged_spans.append((entity.start, entity.end, entity))
 
         sanitized_chars = []
         last_idx = 0
-        for e in entities:
-            sanitized_chars.append(text[last_idx:e.start])
+        for start, end, representative in merged_spans:
+            sanitized_chars.append(text[last_idx:start])
             if placeholder:
-                sanitized_chars.append(e.masked_placeholder)
+                sanitized_chars.append(representative.masked_placeholder)
             else:
-                sanitized_chars.append("*" * len(e.matched_value))
-            last_idx = e.end
+                sanitized_chars.append("*" * (end - start))
+            last_idx = end
         sanitized_chars.append(text[last_idx:])
 
         return "".join(sanitized_chars), entities

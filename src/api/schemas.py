@@ -83,6 +83,17 @@ class EvaluationRequest(BaseModel):
         return self
 
 
+class PIIEntityResponse(BaseModel):
+    """Safe metadata for a detected sensitive value; never contains the value."""
+    entity_type: str
+    start: int
+    end: int
+    confidence: float
+    masked_placeholder: str
+    redacted: bool
+    source: Optional[Literal["prompt", "response"]] = None
+
+
 class EvaluationResponse(BaseModel):
     """Output payload representing the shield decision and all metrics."""
     prompt_id: Optional[str] = None
@@ -96,7 +107,7 @@ class EvaluationResponse(BaseModel):
         default_factory=dict,
         description="Explainable feature percentage contributions to composite risk score (sums to 1.0)",
     )
-    pii_detected: List[Dict[str, Any]] = Field(
+    pii_detected: List[PIIEntityResponse] = Field(
         default_factory=list,
         description="Detected sensitive PII entities or credentials",
     )
@@ -110,7 +121,7 @@ class EvaluationResponse(BaseModel):
     )
     leaked_canary_token: Optional[str] = Field(
         default=None,
-        description="The specific leaked canary honeytoken if detected",
+        description="Deprecated compatibility field; sensitive token values are never returned",
     )
     extraction_mode: str = Field(default="metric", description="'text' if auto-extracted, 'metric' if caller-provided")
     backend: str = Field(..., description="Inference execution backend (onnx | sklearn_joblib)")

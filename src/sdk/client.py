@@ -10,6 +10,7 @@ import logging
 from typing import Any, Dict, List, Optional
 
 import httpx
+from src.ml.pii_detector import get_pii_detector
 
 logger = logging.getLogger("evalshield_sdk")
 
@@ -31,11 +32,12 @@ class EvalShieldBlockedException(EvalShieldException):
     ) -> None:
         self.decision = decision
         self.risk_score = risk_score
-        self.violations = violations
-        self.prompt_id = prompt_id
+        detector = get_pii_detector()
+        self.violations = [detector.redact_pii(str(item))[0] for item in violations]
+        self.prompt_id = detector.redact_pii(prompt_id)[0] if prompt_id else None
         super().__init__(
             f"EvalShield Guardrail BLOCKED interaction (risk={risk_score:.2f}). "
-            f"Violations: {'; '.join(violations)}"
+            f"Violations: {'; '.join(self.violations)}"
         )
 
 
@@ -98,7 +100,7 @@ class EvalShieldClient:
                 resp = client.post("/evaluate", json=payload)
                 if resp.status_code != 200:
                     raise EvalShieldException(
-                        f"EvalShield API request failed ({resp.status_code}): {resp.text}"
+                        f"EvalShield API request failed ({resp.status_code})."
                     )
                 return resp.json()
 
@@ -106,7 +108,7 @@ class EvalShieldClient:
             resp = client.post("/evaluate", json=payload)
             if resp.status_code != 200:
                 raise EvalShieldException(
-                    f"EvalShield API request failed ({resp.status_code}): {resp.text}"
+                    f"EvalShield API request failed ({resp.status_code})."
                 )
             return resp.json()
 
@@ -150,7 +152,7 @@ class EvalShieldClient:
             resp = await client.post("/evaluate", json=payload)
             if resp.status_code != 200:
                 raise EvalShieldException(
-                    f"EvalShield API request failed ({resp.status_code}): {resp.text}"
+                    f"EvalShield API request failed ({resp.status_code})."
                 )
             return resp.json()
 
@@ -188,13 +190,13 @@ class EvalShieldClient:
             with TestClient(self.app, base_url=self.base_url) as client:
                 res = client.post("/red-team/simulate", json=payload)
                 if res.status_code != 200:
-                    raise EvalShieldException(f"Red-team simulation failed ({res.status_code}): {res.text}")
+                    raise EvalShieldException(f"Red-team simulation failed ({res.status_code}).")
                 return res.json()
 
         with httpx.Client(base_url=self.base_url, timeout=self.timeout) as client:
             res = client.post("/red-team/simulate", json=payload)
             if res.status_code != 200:
-                raise EvalShieldException(f"Red-team simulation failed ({res.status_code}): {res.text}")
+                raise EvalShieldException(f"Red-team simulation failed ({res.status_code}).")
             return res.json()
 
     async def async_simulate_red_team(
@@ -215,5 +217,5 @@ class EvalShieldClient:
         async with httpx.AsyncClient(base_url=self.base_url, transport=transport, timeout=self.timeout) as client:
             res = await client.post("/red-team/simulate", json=payload)
             if res.status_code != 200:
-                raise EvalShieldException(f"Red-team simulation failed ({res.status_code}): {res.text}")
+                raise EvalShieldException(f"Red-team simulation failed ({res.status_code}).")
             return res.json()

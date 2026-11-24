@@ -11,9 +11,11 @@ Validates:
 from __future__ import annotations
 
 import pytest
+import httpx
 
 from src.api.main import app
-from src.sdk import EvalShieldBlockedException, EvalShieldClient, EvalShieldGuard
+import src.sdk.client as sdk_client_module
+from src.sdk import EvalShieldBlockedException, EvalShieldClient, EvalShieldException, EvalShieldGuard
 
 
 @pytest.fixture
@@ -30,6 +32,21 @@ def guard() -> EvalShieldGuard:
 class TestSdkAndDecorators:
     """Test suite for EvalShield SDK client and @guard.protect decorator."""
 
+    def test_blocked_exception_redacts_sensitive_violation_text(self):
+        email = "private.user@example.com"
+        secret = "sk-abcdef1234567890abcdef1234567890"
+        exc = EvalShieldBlockedException(
+            decision="BLOCKED",
+            risk_score=1.0,
+            violations=[f"Leaked {email} and {secret}"],
+            prompt_id=email,
+        )
+        assert email not in str(exc)
+        assert secret not in str(exc)
+        assert email not in " ".join(exc.violations)
+        assert secret not in " ".join(exc.violations)
+        assert email not in str(exc.prompt_id)
+
     def test_sdk_client_evaluate_benign(self, sdk_client: EvalShieldClient):
         """SDK client successfully evaluates benign prompts."""
         res = sdk_client.evaluate(
@@ -37,6 +54,73 @@ class TestSdkAndDecorators:
         )
         assert res["shield_decision"] == "ALLOWED"
         assert res["risk_score"] < 0.40
+
+    def test_sdk_redaction_response_does_not_expose_detected_values(self, sdk_client: EvalShieldClient):
+        email = "private.user@example.com"
+        secret = "sk-abcdef1234567890abcdef1234567890"
+        result = sdk_client.evaluate(
+            prompt_text=f"Contact {email} using key {secret}.",
+            redact_pii=True,
+        )
+        serialized = str(result)
+        assert email not in serialized
+        assert secret not in serialized
+        assert "[REDACTED_EMAIL]" in result["sanitized_prompt"]
+        assert "[REDACTED_OPENAI_KEY]" in result["sanitized_prompt"]
+        assert all(entity["redacted"] for entity in result["pii_detected"])
+
+    def test_sync_red_team_error_does_not_echo_response_body(self, monkeypatch):
+        email = "private.user@example.com"
+        secret = "sk-abcdef1234567890abcdef1234567890"
+        echoed_seed = f"seed={email}; key={secret}"
+        transport = httpx.MockTransport(
+            lambda request: httpx.Response(502, text=echoed_seed, request=request)
+        )
+        real_client = httpx.Client
+
+        def create_client(**kwargs):
+            kwargs["transport"] = transport
+            return real_client(**kwargs)
+
+        monkeypatch.setattr(
+            sdk_client_module.httpx,
+            "Client",
+            create_client,
+        )
+
+        with pytest.raises(EvalShieldException) as exc_info:
+            EvalShieldClient(base_url="https://unit.test").simulate_red_team(echoed_seed)
+
+        assert "502" in str(exc_info.value)
+        assert email not in str(exc_info.value)
+        assert secret not in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_async_red_team_error_does_not_echo_response_body(self, monkeypatch):
+        email = "private.user@example.com"
+        secret = "sk-abcdef1234567890abcdef1234567890"
+        echoed_seed = f"seed={email}; key={secret}"
+        transport = httpx.MockTransport(
+            lambda request: httpx.Response(503, text=echoed_seed, request=request)
+        )
+        real_client = httpx.AsyncClient
+
+        def create_async_client(**kwargs):
+            kwargs["transport"] = transport
+            return real_client(**kwargs)
+
+        monkeypatch.setattr(
+            sdk_client_module.httpx,
+            "AsyncClient",
+            create_async_client,
+        )
+
+        with pytest.raises(EvalShieldException) as exc_info:
+            await EvalShieldClient(base_url="https://unit.test").async_simulate_red_team(echoed_seed)
+
+        assert "503" in str(exc_info.value)
+        assert email not in str(exc_info.value)
+        assert secret not in str(exc_info.value)
 
     def test_sdk_client_evaluate_injection_blocked(self, sdk_client: EvalShieldClient):
         """SDK client correctly identifies and blocks adversarial inputs."""

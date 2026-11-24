@@ -30,8 +30,9 @@ from typing import Any, AsyncGenerator, Deque, Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 from fastapi import FastAPI, HTTPException, Request, Response, status
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from scipy.stats import ks_2samp
 
 from src.api.schemas import (
@@ -268,6 +269,12 @@ app.add_middleware(
 )
 
 
+@app.exception_handler(RequestValidationError)
+async def safe_validation_error(request: Request, exc: RequestValidationError) -> JSONResponse:
+    """Do not echo rejected request values (which may contain PII) in 422 bodies."""
+    return JSONResponse(status_code=422, content={"detail": "Invalid request payload."})
+
+
 @app.middleware("http")
 async def add_timing_and_security_headers(request: Request, call_next) -> Response:
     """Inject timing and hardened security headers into every response."""
@@ -492,31 +499,50 @@ async def prometheus_metrics() -> Response:
 
 def _evaluate_interaction(payload: EvaluationRequest) -> Tuple[Dict[str, Any], str]:
     """Execute complete unified evaluation pipeline: feature extraction, inference, PII, canary, and attribution."""
-    features, extraction_mode = _resolve_features(payload)
-    result = _cached_predict(features, prompt_id=payload.prompt_id)
-    result["prompt_id"] = payload.prompt_id
+    pii_detector = get_pii()
+    safe_prompt_id = pii_detector.redact_pii(payload.prompt_id)[0] if payload.prompt_id else None
+    sanitized_text: Optional[str] = None
+    prompt_entities = []
+    response_entities = []
+
+    # Scan original values for metadata, and redact before feature extraction
+    # whenever the caller opted in. The model and extractor only see sanitized
+    # text in that mode.
+    processed_payload = payload
+    if payload.prompt_text:
+        if payload.redact_pii:
+            sanitized_text, prompt_entities = pii_detector.redact_pii(payload.prompt_text)
+        else:
+            prompt_entities = pii_detector.detect_pii(payload.prompt_text)
+    if payload.response_text:
+        if payload.redact_pii:
+            sanitized_response, response_entities = pii_detector.redact_pii(payload.response_text)
+        else:
+            sanitized_response = payload.response_text
+            response_entities = pii_detector.detect_pii(payload.response_text)
+    else:
+        sanitized_response = payload.response_text
+
+    if payload.redact_pii:
+        processed_payload = payload.model_copy(
+            update={"prompt_text": sanitized_text, "response_text": sanitized_response}
+        )
+
+    features, extraction_mode = _resolve_features(processed_payload)
+    result = _cached_predict(features, prompt_id=safe_prompt_id)
+    result["prompt_id"] = safe_prompt_id
     result["extraction_mode"] = extraction_mode
 
     # 1. Compute explainable risk contributions (sums to 1.0)
     result["risk_contributions"] = _calculate_risk_contributions(features)
 
     # 2. Sensitive PII & Secret scanning / redaction
-    pii_detector = get_pii()
-    sanitized_text: Optional[str] = None
-    pii_entities_list: List[Dict[str, Any]] = []
-
-    if payload.prompt_text:
-        if payload.redact_pii:
-            sanitized_text, entities = pii_detector.redact_pii(payload.prompt_text)
-            pii_entities_list = [e.to_dict() for e in entities]
-        else:
-            entities = pii_detector.detect_pii(payload.prompt_text)
-            pii_entities_list = [e.to_dict() for e in entities]
-
-    if payload.response_text:
-        resp_entities = pii_detector.detect_pii(payload.response_text)
-        for re_item in resp_entities:
-            pii_entities_list.append(re_item.to_dict())
+    pii_entities_list: List[Dict[str, Any]] = [
+        entity.to_dict(redacted=payload.redact_pii, source="prompt") for entity in prompt_entities
+    ]
+    pii_entities_list.extend(
+        entity.to_dict(redacted=payload.redact_pii, source="response") for entity in response_entities
+    )
 
     result["sanitized_prompt"] = sanitized_text
     result["pii_detected"] = pii_entities_list
@@ -532,10 +558,12 @@ def _evaluate_interaction(payload: EvaluationRequest) -> Tuple[Dict[str, Any], s
             result["risk_score"] = 1.0
             result["confidence"] = 1.0
             result["canary_leak_detected"] = True
-            result["leaked_canary_token"] = leaked_token
+            # Preserve the response field for compatibility, but never return
+            # the canary value itself.
+            result["leaked_canary_token"] = None
             reasons = list(result.get("violation_reasons", []))
             reasons.append(
-                f"CRITICAL: System prompt canary honeytoken leaked in model output ({leaked_token})"
+                "CRITICAL: System prompt canary honeytoken detected in model output."
             )
             result["violation_reasons"] = reasons
 
@@ -570,11 +598,12 @@ async def evaluate_single(payload: EvaluationRequest) -> EvaluationResponse:
         )
 
         return EvaluationResponse(**result)
-    except (ValueError, KeyError) as exc:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
-    except Exception as exc:
-        logger.error("Inference failed: %s", exc, exc_info=True)
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Inference error: {exc}")
+    except (ValueError, KeyError):
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Invalid evaluation input.")
+    except Exception:
+        # Exception text and tracebacks can contain user supplied values.
+        logger.error("Inference failed during evaluation.")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Inference failed.")
 
 
 @app.post("/evaluate/stream", tags=["Streaming"])
@@ -584,38 +613,47 @@ async def evaluate_streaming(payload: EvaluationRequest) -> StreamingResponse:
     Streams safety checks and emits early terminate signals if safety constraints are breached.
     """
     async def sse_generator() -> AsyncGenerator[str, None]:
-        # Event 1: Pipeline Init
-        yield f"event: init\ndata: {json.dumps({'prompt_id': payload.prompt_id, 'status': 'connected'})}\n\n"
-        await asyncio.sleep(0.01)
+        try:
+            pii_detector = get_pii()
+            safe_prompt_id = pii_detector.redact_pii(payload.prompt_id)[0] if payload.prompt_id else None
+            # Event 1: Pipeline Init
+            yield f"event: init\ndata: {json.dumps({'prompt_id': safe_prompt_id, 'status': 'connected'})}\n\n"
+            await asyncio.sleep(0.01)
 
-        # Event 2: PII Scan
-        pii_detector = get_pii()
-        pii_list = []
-        if payload.prompt_text:
-            entities = pii_detector.detect_pii(payload.prompt_text)
-            pii_list = [e.to_dict() for e in entities]
+            # Event 2: PII Scan
+            pii_list = []
+            if payload.prompt_text:
+                if payload.redact_pii:
+                    _, entities = pii_detector.redact_pii(payload.prompt_text)
+                else:
+                    entities = pii_detector.detect_pii(payload.prompt_text)
+                pii_list = [e.to_dict(redacted=payload.redact_pii, source="prompt") for e in entities]
 
-        yield f"event: pii_scan\ndata: {json.dumps({'pii_count': len(pii_list), 'entities': pii_list})}\n\n"
-        await asyncio.sleep(0.01)
+            yield f"event: pii_scan\ndata: {json.dumps({'pii_count': len(pii_list), 'entities': pii_list})}\n\n"
+            await asyncio.sleep(0.01)
 
-        # Event 3: Evaluation Verdict
-        res, extraction_mode = _evaluate_interaction(payload)
+            # Event 3: Evaluation Verdict
+            res, extraction_mode = _evaluate_interaction(payload)
 
-        verdict_payload = {
-            "shield_decision": res["shield_decision"],
-            "risk_score": res["risk_score"],
-            "confidence": res["confidence"],
-            "risk_contributions": res.get("risk_contributions", {}),
-            "category_scores": res["category_scores"],
-            "violation_reasons": res.get("violation_reasons", []),
-            "canary_leak_detected": res.get("canary_leak_detected", False),
-            "action": "ABORT_STREAM" if res["shield_decision"] == "BLOCKED" else "CONTINUE",
-        }
-        yield f"event: verdict\ndata: {json.dumps(verdict_payload)}\n\n"
-        await asyncio.sleep(0.01)
+            verdict_payload = {
+                "shield_decision": res["shield_decision"],
+                "risk_score": res["risk_score"],
+                "confidence": res["confidence"],
+                "risk_contributions": res.get("risk_contributions", {}),
+                "category_scores": res["category_scores"],
+                "violation_reasons": res.get("violation_reasons", []),
+                "canary_leak_detected": res.get("canary_leak_detected", False),
+                "action": "ABORT_STREAM" if res["shield_decision"] == "BLOCKED" else "CONTINUE",
+            }
+            yield f"event: verdict\ndata: {json.dumps(verdict_payload)}\n\n"
+            await asyncio.sleep(0.01)
 
-        # Event 4: Complete
-        yield f"event: done\ndata: {json.dumps({'status': 'completed', 'decision': res['shield_decision']})}\n\n"
+            # Event 4: Complete
+            yield f"event: done\ndata: {json.dumps({'status': 'completed', 'decision': res['shield_decision']})}\n\n"
+        except Exception:
+            # Never emit exception text or tracebacks into server logs or SSE.
+            logger.error("Streaming evaluation failed.")
+            yield f"event: error\ndata: {json.dumps({'error': 'Evaluation failed.'})}\n\n"
 
     return StreamingResponse(sse_generator(), media_type="text/event-stream")
 
@@ -631,23 +669,29 @@ async def evaluate_batch(batch: BatchEvaluationRequest) -> BatchEvaluationRespon
     results: List[EvaluationResponse] = []
     allowed = flagged = blocked = 0
 
-    for item in batch.items:
-        result, extraction_mode = _evaluate_interaction(item)
-        res = EvaluationResponse(**result)
-        results.append(res)
+    try:
+        for item in batch.items:
+            result, extraction_mode = _evaluate_interaction(item)
+            res = EvaluationResponse(**result)
+            results.append(res)
 
-        _record_telemetry(
-            decision=res.shield_decision,
-            mode=extraction_mode,
-            latency_ms=res.latency_ms,
-        )
+            _record_telemetry(
+                decision=res.shield_decision,
+                mode=extraction_mode,
+                latency_ms=res.latency_ms,
+            )
 
-        if res.shield_decision == "ALLOWED":
-            allowed += 1
-        elif res.shield_decision == "FLAGGED":
-            flagged += 1
-        else:
-            blocked += 1
+            if res.shield_decision == "ALLOWED":
+                allowed += 1
+            elif res.shield_decision == "FLAGGED":
+                flagged += 1
+            else:
+                blocked += 1
+    except (ValueError, KeyError):
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Invalid evaluation input.")
+    except Exception:
+        logger.error("Batch evaluation failed.")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Batch evaluation failed.")
 
     batch_latency = (time.perf_counter() - t_start) * 1000.0
     return BatchEvaluationResponse(
@@ -729,8 +773,9 @@ async def simulate_red_team_campaign(
 ) -> RedTeamSimulateResponse:
     """Execute an automated genetic adversarial red-teaming campaign against the shield."""
     fuzzer = get_red_team_fuzzer()
+    safe_seed_prompt = get_pii().redact_pii(request.seed_prompt)[0]
     campaign_res = fuzzer.run_campaign(
-        seed_prompt=request.seed_prompt,
+        seed_prompt=safe_seed_prompt,
         rounds=request.rounds,
         allowed_types=request.mutation_types,
         trigger_recalibration=request.trigger_recalibration,
