@@ -334,7 +334,9 @@ Validates:
 
 ## 6. Docker Orchestration
 
-Run the complete multi-service stack:
+Run the multi-service stack for local development/demo use:
+
+The API runs in its default anonymous demo mode. The published API and frontend ports bind only to the host loopback interface (`127.0.0.1:8000` and `127.0.0.1:8080`). This is not a production deployment configuration. Production deployments require production authentication with a securely configured API key and HTTPS/TLS for bearer-token transmission.
 
 ```bash
 docker compose -f docker/docker-compose.yml up --build -d
