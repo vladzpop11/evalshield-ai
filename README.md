@@ -239,8 +239,10 @@ python -m src.ml.model_generator
 
 ### Step 3: Run the FastAPI Service
 
+For local development, bind the API to loopback:
+
 ```bash
-uvicorn src.api.main:app --host 0.0.0.0 --port 8000 --reload
+uvicorn src.api.main:app --host 127.0.0.1 --port 8000 --reload
 ```
 - Interactive Swagger UI: [http://localhost:8000/docs](http://localhost:8000/docs)
 - Prometheus Metrics: [http://localhost:8000/metrics](http://localhost:8000/metrics)
@@ -259,9 +261,12 @@ Only `GET /health` remains public. All other API operations require `Authorizati
 
 Generate a deployment key outside the repository and provide it through your secret manager or environment:
 
+API-key authentication does not encrypt traffic. Uvicorn's HTTP listener is not TLS protection: clients, including SDK clients, must use HTTPS whenever communication crosses an untrusted network. This repository does not provide TLS termination. In production, terminate TLS at a trusted reverse proxy, ingress, or equivalent infrastructure. HTTP between that boundary and Uvicorn is acceptable only over an appropriately trusted and isolated backend connection. Never expose the Uvicorn HTTP listener directly to an untrusted network. The production command below is only an internal backend listener; setting the mode and key alone does not secure transport.
+
 ```bash
 export EVALSHIELD_MODE=production
 export EVALSHIELD_API_KEY="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"
+# Internal listener reachable only through the trusted TLS-terminating boundary.
 uvicorn src.api.main:app --host 0.0.0.0 --port 8000
 ```
 
@@ -271,7 +276,10 @@ The Python SDK accepts the same key without changing existing unauthenticated de
 import os
 from src.sdk import EvalShieldClient
 
-client = EvalShieldClient(api_key=os.environ.get("EVALSHIELD_API_KEY"))
+client = EvalShieldClient(
+    base_url="https://api.example.com",  # Use the TLS-protected API endpoint.
+    api_key=os.environ["EVALSHIELD_API_KEY"],
+)
 ```
 
 ### Step 4: Open the Web UI Dashboard
