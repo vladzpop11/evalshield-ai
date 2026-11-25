@@ -42,6 +42,8 @@ test.describe('EvalShield-AI Visual & Responsive Layout Tests', () => {
   });
 
   test('should render distinct visual alert themes for verdicts', async ({ page }) => {
+    await page.goto('/index.html?mode=simulation');
+
     // 1. Initial State: Green Allowed
     const banner = page.locator('#verdict-banner');
     await expect(banner).toHaveClass(/banner-allowed/);

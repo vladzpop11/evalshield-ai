@@ -284,11 +284,12 @@ client = EvalShieldClient(
 
 ### Step 4: Open the Web UI Dashboard
 
-Serve the static dashboard:
+The Docker Compose/Nginx dashboard uses same-origin API routes by default. To run the static dashboard without an API proxy, explicitly enable its client-side simulation mode:
+
 ```bash
 python3 -m http.server 8080
 ```
-Visit [http://localhost:8080](http://localhost:8080) to interact with the guardrail playground.
+Visit [http://localhost:8080/index.html?mode=simulation](http://localhost:8080/index.html?mode=simulation). Simulation results are generated in the browser and are not server evaluations. For standalone local API-backed development, set the `evalshield-api-base` meta tag in `index.html` to `http://127.0.0.1:8000`; this is a public endpoint setting, not a place for credentials.
 
 ---
 

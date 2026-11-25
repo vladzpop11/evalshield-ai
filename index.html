@@ -4,6 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="description" content="EvalShield-AI: Enterprise AI Guardrail and Quality Evaluation Dashboard">
+  <meta name="evalshield-api-base" content="">
   <title>EvalShield-AI | Quality & Guardrail Shield</title>
   <style>
     :root {
@@ -357,6 +358,26 @@
       border-top: 1px solid var(--border-color);
       padding-top: 1rem;
     }
+
+    .mode-notice, .api-error {
+      max-width: 1200px;
+      margin: 1rem auto;
+      padding: 0.8rem 1rem;
+      border-radius: 6px;
+      font-weight: 600;
+    }
+
+    .mode-notice {
+      background: #78350f;
+      border: 1px solid #f59e0b;
+      color: #fef3c7;
+    }
+
+    .api-error {
+      background: #450a0a;
+      border: 1px solid #ef4444;
+      color: #fecaca;
+    }
   </style>
 </head>
 <body>
@@ -372,10 +393,15 @@
     </div>
   </header>
 
+  <div id="simulation-mode-notice" class="mode-notice" role="status" hidden>
+    LOCAL SIMULATION MODE — results are generated in this browser, are not API-backed, and must not be used as safety decisions.
+  </div>
+
   <main role="main">
     <!-- Interactive Evaluation Panel -->
     <section class="card" aria-labelledby="eval-panel-title">
       <h2 id="eval-panel-title" class="card-title">Interaction Shield Evaluator</h2>
+      <div id="evaluation-api-error" class="api-error" role="alert" hidden></div>
 
       <div class="preset-container" role="group" aria-label="Quick Test Presets">
         <button type="button" class="btn-preset" id="preset-benign">Benign Interaction</button>
@@ -470,6 +496,8 @@
     <section class="card" aria-labelledby="results-panel-title">
       <h2 id="results-panel-title" class="card-title">Shield Verdict & Diagnostics</h2>
 
+      <div id="evaluation-result-content">
+
       <div id="verdict-banner" class="decision-banner banner-allowed" role="region" aria-live="polite" aria-atomic="true">
         <span class="decision-badge" id="decision-text">ALLOWED</span>
         <span id="decision-subtext">Content complies with all safety policies</span>
@@ -521,6 +549,7 @@
         <div class="metric-label" style="margin-bottom: 0.35rem;">Sanitized Output (PII Scrubbed)</div>
         <p id="sanitized-text" style="font-size: 0.875rem; color: #86efac; word-break: break-all;"></p>
       </div>
+      </div>
     </section>
 
     <!-- RedShield Autonomous Adversarial Red-Teaming Simulator -->
@@ -534,6 +563,7 @@
       <p style="font-size: 0.875rem; color: var(--text-muted); margin-bottom: 1rem;">
         Continuously attacks the guardrail using genetic mutation operators (leet-speak, token splitting, base64 wrapping, roleplay cognitive dissonance, and delimiter hijacking) to empirically calculate the Attack Success Rate (ASR) and trigger closed-loop drift recalibration.
       </p>
+      <div id="redteam-api-error" class="api-error" role="alert" hidden></div>
 
       <div style="display: flex; gap: 1rem; align-items: flex-end; flex-wrap: wrap; margin-bottom: 1rem;">
         <div style="flex: 2; min-width: 260px;">
@@ -568,15 +598,40 @@
   <footer role="contentinfo">
     <p style="margin-bottom: 0.5rem;">EvalShield-AI MLOps Platform &bull; Automated End-to-End Test Suite & ML Guardrails</p>
     <p style="font-size: 0.8125rem;">
-      <a href="http://localhost:8000/docs" target="_blank" rel="noopener" style="color: var(--brand-primary); margin: 0 0.5rem;">API Swagger Docs</a> &bull;
-      <a href="http://localhost:8000/metrics" target="_blank" rel="noopener" style="color: var(--brand-primary); margin: 0 0.5rem;">Prometheus Metrics</a> &bull;
-      <a href="http://localhost:8000/model/compliance-report" target="_blank" rel="noopener" style="color: var(--brand-primary); margin: 0 0.5rem;">NIST & EU AI Act Report</a> &bull;
-      <a href="http://localhost:8000/model/shadow-stats" target="_blank" rel="noopener" style="color: var(--brand-primary); margin: 0 0.5rem;">Shadow Router Telemetry</a>
+      <a href="/docs" data-api-path="/docs" target="_blank" rel="noopener" style="color: var(--brand-primary); margin: 0 0.5rem;">API Swagger Docs</a> &bull;
+      <a href="/metrics" data-api-path="/metrics" target="_blank" rel="noopener" style="color: var(--brand-primary); margin: 0 0.5rem;">Prometheus Metrics</a> &bull;
+      <a href="/model/compliance-report" data-api-path="/model/compliance-report" target="_blank" rel="noopener" style="color: var(--brand-primary); margin: 0 0.5rem;">NIST & EU AI Act Report</a> &bull;
+      <a href="/model/shadow-stats" data-api-path="/model/shadow-stats" target="_blank" rel="noopener" style="color: var(--brand-primary); margin: 0 0.5rem;">Shadow Router Telemetry</a>
     </p>
   </footer>
 
   <script>
     (function() {
+      const queryParams = new URLSearchParams(window.location.search);
+      const SIMULATION_MODE = queryParams.get('mode') === 'simulation';
+      const apiBaseMeta = document.querySelector('meta[name="evalshield-api-base"]');
+      const API_BASE_URL = (apiBaseMeta?.content || '').replace(/\/+$/, '');
+      const apiUrl = (path) => `${API_BASE_URL}${path}`;
+      const simulationNotice = document.getElementById('simulation-mode-notice');
+      if (SIMULATION_MODE) simulationNotice.hidden = false;
+
+      document.querySelectorAll('[data-api-path]').forEach((link) => {
+        link.href = apiUrl(link.dataset.apiPath);
+      });
+
+      function showApiError(element, statusCode, action) {
+        if (statusCode === 401) {
+          element.textContent = `API authentication failed (401). No ${action} was performed.`;
+        } else if (statusCode === 403) {
+          element.textContent = `API authorization failed (403). No ${action} was performed.`;
+        } else if (statusCode) {
+          element.textContent = `API request failed (HTTP ${statusCode}). No ${action} was performed.`;
+        } else {
+          element.textContent = `Could not reach the API. No ${action} was performed.`;
+        }
+        element.hidden = false;
+      }
+
       // Elements
       const pairs = [
         { slider: 'toxicity-slider', num: 'toxicity-num', disp: 'toxicity-val-display' },
@@ -685,27 +740,37 @@
         if (currentResponseText) payload.response_text = currentResponseText;
 
         const submitBtn = document.getElementById('btn-submit-eval');
+        const errorNotice = document.getElementById('evaluation-api-error');
+        const resultContent = document.getElementById('evaluation-result-content');
         submitBtn.disabled = true;
         submitBtn.textContent = "Evaluating...";
+        errorNotice.hidden = true;
+        resultContent.hidden = true;
 
         let resultData = null;
-        const apiHost = window.location.port === "8000" || window.location.pathname.startsWith('/api') ? "" : "http://localhost:8000";
-
-        try {
-          const res = await fetch(`${apiHost}/evaluate`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(payload)
-          });
-          if (res.ok) {
+        if (!SIMULATION_MODE) {
+          try {
+            const res = await fetch(apiUrl('/evaluate'), {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(payload)
+            });
+            if (!res.ok) {
+              showApiError(errorNotice, res.status, 'evaluation');
+              return;
+            }
             resultData = await res.json();
+          } catch (err) {
+            showApiError(errorNotice, null, 'evaluation');
+            return;
+          } finally {
+            submitBtn.disabled = false;
+            submitBtn.innerHTML = "<span aria-hidden='true'>&#x25B6;</span> Run Guardrail Evaluation";
           }
-        } catch (err) {
-          // If server is not running directly on localhost:8000, calculate deterministic fallback
         }
 
-        if (!resultData) {
-          // Client-side fallback evaluator for standalone browser testing
+        if (SIMULATION_MODE) {
+          // Client-side scoring is only available through explicit simulation mode.
           const riskFactor = (
             0.35 * payload.prompt_injection_score +
             0.30 * payload.toxicity_score +
@@ -771,7 +836,7 @@
             shield_decision: decision,
             risk_score: finalRisk,
             confidence: 0.96,
-            backend: "onnx (client fallback)",
+            backend: "Local simulation (client-side)",
             latency_ms: 3.8,
             violation_reasons: violations,
             canary_leak_detected: canaryLeakDetected,
@@ -782,6 +847,7 @@
         }
 
         renderResults(resultData);
+        resultContent.hidden = false;
         submitBtn.disabled = false;
         submitBtn.innerHTML = "<span aria-hidden='true'>&#x25B6;</span> Run Guardrail Evaluation";
       });
@@ -909,32 +975,41 @@
           redteamBtn.textContent = "Fuzzing & Mutating...";
 
           const resultsBox = document.getElementById('redteam-results-box');
+          const errorNotice = document.getElementById('redteam-api-error');
           const asrBadge = document.getElementById('redteam-asr-badge');
           const receiptSpan = document.getElementById('redteam-receipt');
           const vectorsList = document.getElementById('redteam-vectors-list');
+          resultsBox.style.display = 'none';
+          errorNotice.hidden = true;
 
           let campaignData = null;
-          const apiHost = window.location.port === "8000" || window.location.pathname.startsWith('/api') ? "" : "http://localhost:8000";
-
-          try {
-            const res = await fetch(`${apiHost}/red-team/simulate`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                seed_prompt: seedPrompt,
-                rounds: rounds,
-                trigger_recalibration: false
-              })
-            });
-            if (res.ok) {
+          if (!SIMULATION_MODE) {
+            try {
+              const res = await fetch(apiUrl('/red-team/simulate'), {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  seed_prompt: seedPrompt,
+                  rounds: rounds,
+                  trigger_recalibration: false
+                })
+              });
+              if (!res.ok) {
+                showApiError(errorNotice, res.status, 'red-team campaign');
+                return;
+              }
               campaignData = await res.json();
+            } catch (err) {
+              showApiError(errorNotice, null, 'red-team campaign');
+              return;
+            } finally {
+              redteamBtn.disabled = false;
+              redteamBtn.innerHTML = "&#x1F525; Launch Attack Campaign";
             }
-          } catch (e) {
-            // Standalone client fallback for red-team campaign
           }
 
-          if (!campaignData) {
-            // Client-side fallback mutation generator
+          if (SIMULATION_MODE) {
+            // Local synthetic campaigns are available only in explicit simulation mode.
             const mutTypes = ['leet_speak', 'payload_split', 'base64_wrap', 'roleplay_frame', 'hypothetical', 'delimiter_injection'];
             const vectors = [];
             for (let i = 0; i < rounds; i++) {
@@ -972,7 +1047,9 @@
           if (campaignData.attack_success_rate === 0) {
             asrBadge.style.background = '#166534';
             asrBadge.style.color = '#bbf7d0';
-            asrBadge.textContent = `${asrPct}% ASR (100% Defended)`;
+            asrBadge.textContent = SIMULATION_MODE
+              ? `${asrPct}% ASR (simulation only)`
+              : `${asrPct}% ASR (100% Defended)`;
           } else {
             asrBadge.style.background = '#991b1b';
             asrBadge.style.color = '#fecaca';

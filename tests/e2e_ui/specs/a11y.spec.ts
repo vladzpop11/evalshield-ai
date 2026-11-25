@@ -13,7 +13,7 @@ test.describe('EvalShield-AI Accessibility (WCAG 2.2 AA Compliance)', () => {
   });
 
   test('should remain accessible after dynamic state transition to BLOCKED verdict', async ({ page }) => {
-    await page.goto('/index.html');
+    await page.goto('/index.html?mode=simulation');
 
     // Trigger state transition
     await page.locator('#preset-injection').click();
@@ -30,7 +30,7 @@ test.describe('EvalShield-AI Accessibility (WCAG 2.2 AA Compliance)', () => {
   });
 
   test('should support keyboard navigation across interactive controls', async ({ page }) => {
-    await page.goto('/index.html');
+    await page.goto('/index.html?mode=simulation');
 
     // Start tabbing from beginning
     await page.keyboard.press('Tab');
