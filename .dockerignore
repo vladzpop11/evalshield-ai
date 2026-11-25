@@ -1,0 +1,65 @@
+# Version control and CI metadata
+.git
+.github
+
+# Local Python and Node development environments
+.venv
+venv
+env
+**/.venv
+**/venv
+**/env
+node_modules
+**/node_modules
+
+# Environment files and local credentials; keep non-secret templates available
+.env
+.env.*
+!.env.example
+**/.env
+**/.env.*
+!**/.env.example
+.secrets
+.aws
+.ssh
+**/*.pem
+**/*.key
+**/*.p12
+**/*.pfx
+
+# Python caches, test output, and coverage reports
+__pycache__
+**/__pycache__
+*.py[cod]
+.pytest_cache
+**/.pytest_cache
+.mypy_cache
+.ruff_cache
+.tox
+.nox
+.coverage
+.coverage.*
+coverage.xml
+coverage/
+htmlcov/
+tests/
+
+# Frontend test output and local build artifacts
+test-results/
+playwright-report/
+blob-report/
+dist/
+build/
+
+# Logs, temporary files, and editor/OS artifacts
+*.log
+logs/
+*.tmp
+*.temp
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
