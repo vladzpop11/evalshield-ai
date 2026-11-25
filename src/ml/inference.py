@@ -17,7 +17,7 @@ from typing import Any, Dict, List, Optional
 import joblib
 import numpy as np
 
-from .model_generator import CLASS_MAPPING, CLASS_NAMES, FEATURE_NAMES, generate_shield_model
+from .model_generator import CLASS_MAPPING, CLASS_NAMES, FEATURE_NAMES
 
 try:
     import onnxruntime as ort
@@ -55,25 +55,31 @@ class EvalShieldEngine:
         self._initialize_model()
 
     def _initialize_model(self) -> None:
-        """Ensure artifacts exist, generate if missing, and load into memory.
+        """Load prebuilt model artifacts into memory without modifying the filesystem.
 
         Backend selection priority (unless overridden by preferred_backend):
         1. INT8-quantized ONNX (fastest CPU execution, ~40% speedup)
         2. FP32 ONNX (full precision fallback)
         3. Scikit-learn/Joblib pipeline (pure Python fallback)
         """
-        if not self.joblib_path.exists() and not self.onnx_path.exists():
-            logger.info("Artifacts not found in %s. Triggering model generation...", self.artifacts_dir)
-            generate_shield_model(output_dir=self.artifacts_dir)
+        int8_path = self.artifacts_dir / "evalshield_model_int8.onnx"
+        if not any(path.is_file() for path in (int8_path, self.onnx_path, self.joblib_path)):
+            raise FileNotFoundError(
+                "No model artifacts found. Build or regenerate the model before starting the API."
+            )
 
         if self.metadata_path.exists():
-            with open(self.metadata_path, "r", encoding="utf-8") as f:
-                self.metadata = json.load(f)
+            try:
+                with open(self.metadata_path, "r", encoding="utf-8") as f:
+                    self.metadata = json.load(f)
+            except (OSError, UnicodeError, json.JSONDecodeError):
+                raise RuntimeError(
+                    "Model metadata is unreadable. Rebuild the image with valid model artifacts."
+                ) from None
 
         pref = (self.preferred_backend or "").lower()
 
         # 1. INT8 quantized ONNX
-        int8_path = self.artifacts_dir / "evalshield_model_int8.onnx"
         if (pref in ("", "onnx_int8")) and ORT_AVAILABLE and int8_path.exists():
             try:
                 opts = ort.SessionOptions()
@@ -87,8 +93,8 @@ class EvalShieldEngine:
                 self.backend = "onnx_int8"
                 logger.info("EvalShield loaded INT8-quantized ONNX backend.")
                 return
-            except Exception as e:
-                logger.warning("INT8 ONNX load failed (%s). Trying FP32 ONNX.", e)
+            except Exception:
+                logger.warning("INT8 ONNX model could not be loaded; trying FP32 ONNX.")
 
         # 2. FP32 ONNX fallback
         if (pref in ("", "onnx")) and ORT_AVAILABLE and self.onnx_path.exists():
@@ -104,16 +110,22 @@ class EvalShieldEngine:
                 self.backend = "onnx"
                 logger.info("EvalShield loaded FP32 ONNX backend.")
                 return
-            except Exception as e:
-                logger.warning("FP32 ONNX load failed (%s). Falling back to Joblib.", e)
+            except Exception:
+                logger.warning("FP32 ONNX model could not be loaded; trying Joblib fallback.")
 
         # 3. Sklearn/Joblib fallback
         if self.joblib_path.exists():
-            self.joblib_model = joblib.load(self.joblib_path)
-            self.backend = "sklearn_joblib"
-            logger.info("EvalShield loaded Joblib pipeline backend.")
-        else:
-            raise RuntimeError(f"Could not load any model from {self.artifacts_dir}")
+            try:
+                self.joblib_model = joblib.load(self.joblib_path)
+                self.backend = "sklearn_joblib"
+                logger.info("EvalShield loaded Joblib pipeline backend.")
+                return
+            except Exception:
+                logger.warning("Joblib model could not be loaded.")
+
+        raise RuntimeError(
+            "No usable model artifact could be loaded. Rebuild the image with valid model artifacts."
+        ) from None
 
     def _extract_feature_vector(self, data: Dict[str, float]) -> np.ndarray:
         """Convert input dict to float32 numpy vector matching training features."""
