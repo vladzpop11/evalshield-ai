@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import random
 import threading
@@ -22,6 +23,7 @@ from pathlib import Path
 from typing import Any, Deque, Dict, List, Optional
 
 from .inference import EvalShieldEngine, get_inference_engine
+from .model_generator import FEATURE_NAMES
 
 logger = logging.getLogger("evalshield_shadow_router")
 
@@ -35,7 +37,6 @@ class ChampionChallengerRouter:
         challenger_engine: Optional[EvalShieldEngine] = None,
         shadow_traffic_rate: Optional[float] = None,
         risk_delta_threshold: float = 0.15,
-        discrepancy_log_path: Optional[Path | str] = None,
         max_workers: int = 2,
     ) -> None:
         self.artifacts_dir = Path(__file__).resolve().parent / "artifacts"
@@ -65,11 +66,6 @@ class ChampionChallengerRouter:
             self.shadow_traffic_rate = float(os.getenv("SHADOW_TRAFFIC_RATE", "1.0"))
 
         self.risk_delta_threshold = risk_delta_threshold
-
-        if discrepancy_log_path is None:
-            self.discrepancy_log_path = self.artifacts_dir / "discrepancy_log.jsonl"
-        else:
-            self.discrepancy_log_path = Path(discrepancy_log_path)
 
         # Thread pool for asynchronous shadow execution
         self._executor = ThreadPoolExecutor(
@@ -176,16 +172,55 @@ class ChampionChallengerRouter:
                     "category_scores": features,
                 }
                 self._recent_discrepancies.append(record)
-                self._write_discrepancy_log(record)
+                self._log_discrepancy(record)
 
-    def _write_discrepancy_log(self, record: Dict[str, Any]) -> None:
-        """Append discrepancy record to JSONL log file thread-safely."""
-        try:
-            self.discrepancy_log_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(self.discrepancy_log_path, "a", encoding="utf-8") as f:
-                f.write(json.dumps(record) + "\n")
-        except Exception as exc:
-            logger.error("Failed to append discrepancy log: %s", exc)
+    def _log_discrepancy(self, record: Dict[str, Any]) -> None:
+        """Emit a bounded, non-prompt discrepancy record through application logging."""
+        safe_backends = {"onnx_int8", "onnx", "sklearn_joblib"}
+        safe_decisions = {"ALLOWED", "FLAGGED", "BLOCKED"}
+
+        def finite_number(value: Any) -> Optional[float]:
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                number = float(value)
+                if math.isfinite(number):
+                    return number
+            return None
+
+        def safe_label(value: Any, allowed_values: set[str]) -> str:
+            return value if isinstance(value, str) and value in allowed_values else "unknown"
+
+        # Prompt identifiers remain available in the bounded in-memory/API record,
+        # but are deliberately excluded from logs because library callers may pass
+        # arbitrary prompt text or secrets as identifiers.
+        discrepancy_type = "+".join(
+            name
+            for name, applies in (
+                ("decision_mismatch", bool(record.get("decision_mismatch"))),
+                ("risk_delta_breach", (finite_number(record.get("risk_delta")) or 0.0) > self.risk_delta_threshold),
+            )
+            if applies
+        )
+        safe_record = {
+            "event": "shadow_discrepancy",
+            "timestamp": record.get("timestamp"),
+            "discrepancy_type": discrepancy_type,
+            "champion_backend": safe_label(record.get("champion_backend"), safe_backends),
+            "challenger_backend": safe_label(record.get("challenger_backend"), safe_backends),
+            "champion_decision": safe_label(record.get("champion_decision"), safe_decisions),
+            "challenger_decision": safe_label(record.get("challenger_decision"), safe_decisions),
+            "decision_mismatch": bool(record.get("decision_mismatch")),
+            "champion_risk_score": finite_number(record.get("champion_risk_score")),
+            "challenger_risk_score": finite_number(record.get("challenger_risk_score")),
+            "risk_delta": finite_number(record.get("risk_delta")),
+            "champion_latency_ms": finite_number(record.get("champion_latency_ms")),
+            "challenger_latency_ms": finite_number(record.get("challenger_latency_ms")),
+            "category_scores": {
+                name: score
+                for name in FEATURE_NAMES
+                if (score := finite_number(record.get("category_scores", {}).get(name))) is not None
+            },
+        }
+        logger.info("shadow_discrepancy=%s", json.dumps(safe_record, sort_keys=True))
 
     def get_shadow_stats(self) -> Dict[str, Any]:
         """Return real-time shadow evaluation and telemetry statistics."""

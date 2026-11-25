@@ -3,8 +3,7 @@
 Validates:
 - Synchronous zero-latency champion execution
 - Asynchronous challenger shadow dispatch
-- Telemetry counting and discrepancy logging
-- Discrepancy JSONL persistence
+- Telemetry counting and safe structured discrepancy logging
 """
 
 from __future__ import annotations
@@ -69,13 +68,10 @@ class TestChampionChallengerRouter:
     def test_shadow_evaluation_dispatched_asynchronously(
         self,
         benign_features: Dict[str, float],
-        tmp_path: Path,
     ):
         """Shadow evaluations run in background and increment shadow stats."""
-        log_file = tmp_path / "test_discrepancies.jsonl"
         router = ChampionChallengerRouter(
             shadow_traffic_rate=1.0,
-            discrepancy_log_path=log_file,
         )
 
         assert router.is_challenger_active is True
@@ -95,10 +91,18 @@ class TestChampionChallengerRouter:
     def test_discrepancy_detection_and_logging(
         self,
         benign_features: Dict[str, float],
-        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+        monkeypatch: pytest.MonkeyPatch,
     ):
-        """When challenger disagrees with champion, discrepancy is logged and counted."""
-        log_file = tmp_path / "discrepancies.jsonl"
+        """Discrepancies are logged safely without writing to the artifact tree."""
+        import logging
+
+        caplog.set_level(logging.INFO, logger="evalshield_shadow_router")
+
+        def reject_filesystem_write(*args: Any, **kwargs: Any) -> None:
+            raise AssertionError("discrepancy logging must not write files")
+
+        monkeypatch.setattr(Path, "mkdir", reject_filesystem_write)
 
         mock_champion = MagicMock()
         mock_champion.backend = "onnx_int8"
@@ -124,10 +128,11 @@ class TestChampionChallengerRouter:
             champion_engine=mock_champion,
             challenger_engine=mock_challenger,
             shadow_traffic_rate=1.0,
-            discrepancy_log_path=log_file,
         )
 
-        res = router.route_and_evaluate(benign_features, prompt_id="discrepancy-req-1")
+        secret = "sk-" + "A" * 24
+        sensitive_identifier = f"alice@example.com prompt {secret}"
+        res = router.route_and_evaluate(benign_features, prompt_id=sensitive_identifier)
         # Champion verdict is authoritative
         assert res["shield_decision"] == "ALLOWED"
 
@@ -140,19 +145,26 @@ class TestChampionChallengerRouter:
         assert stats["decision_mismatches"] == 1
         assert stats["decision_agreement_rate"] == 0.0
 
-        # Verify JSONL log was written
-        assert log_file.exists()
-        with open(log_file, "r", encoding="utf-8") as f:
-            lines = [json.loads(line) for line in f]
-        assert len(lines) == 1
-        assert lines[0]["prompt_id"] == "discrepancy-req-1"
-        assert lines[0]["champion_decision"] == "ALLOWED"
-        assert lines[0]["challenger_decision"] == "BLOCKED"
-        assert lines[0]["decision_mismatch"] is True
+        # The only observable discrepancy record is a JSON log without prompt IDs.
+        log_messages = [r.getMessage() for r in caplog.records if "shadow_discrepancy=" in r.getMessage()]
+        assert len(log_messages) == 1
+        logged_record = json.loads(log_messages[0].split("=", 1)[1])
+        assert logged_record["event"] == "shadow_discrepancy"
+        assert logged_record["discrepancy_type"] == "decision_mismatch+risk_delta_breach"
+        assert logged_record["champion_decision"] == "ALLOWED"
+        assert logged_record["challenger_decision"] == "BLOCKED"
+        assert logged_record["decision_mismatch"] is True
+        assert logged_record["risk_delta"] == 0.83
+        assert "prompt_id" not in logged_record
+        assert sensitive_identifier not in log_messages[0]
+        assert secret not in log_messages[0]
+        assert "alice@example.com" not in log_messages[0]
+        assert not any("Failed to append discrepancy log" in r.getMessage() for r in caplog.records)
+        assert not hasattr(router, "discrepancy_log_path")
 
         recent = router.get_recent_discrepancies()
         assert len(recent) == 1
-        assert recent[0]["prompt_id"] == "discrepancy-req-1"
+        assert recent[0]["prompt_id"] == sensitive_identifier
 
         router.shutdown()
 
