@@ -21,6 +21,7 @@ services:
       - no-new-privileges:true
     cap_drop:
       - ALL
+    read_only: true
     networks:
       - evalshield-net
 
