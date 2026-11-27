@@ -8,6 +8,11 @@ from typing import Any, Dict, List, Literal, Optional
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
+MAX_BATCH_ITEMS = 100
+MAX_BATCH_TEXT_CHARS = 512 * 1024
+MAX_CANARY_TOKEN_CHARS = 256
+
+
 class EvaluationRequest(BaseModel):
     """Input payload for AI safety evaluation.
 
@@ -65,6 +70,15 @@ class EvaluationRequest(BaseModel):
         if v is not None and not v.strip():
             raise ValueError("prompt_text cannot be empty or whitespace only.")
         return v
+
+    @field_validator("canary_tokens")
+    @classmethod
+    def validate_canary_token_lengths(cls, values: Optional[List[str]]) -> Optional[List[str]]:
+        if values is not None and any(len(value) > MAX_CANARY_TOKEN_CHARS for value in values):
+            raise ValueError(
+                f"Each canary token must be at most {MAX_CANARY_TOKEN_CHARS} characters."
+            )
+        return values
 
     @model_validator(mode="after")
     def require_text_or_all_metrics(self) -> "EvaluationRequest":
@@ -131,7 +145,20 @@ class EvaluationResponse(BaseModel):
 
 class BatchEvaluationRequest(BaseModel):
     """Batch evaluation container payload."""
-    items: List[EvaluationRequest] = Field(..., min_length=1, max_length=1000)
+    items: List[EvaluationRequest] = Field(..., min_length=1, max_length=MAX_BATCH_ITEMS)
+
+    @model_validator(mode="after")
+    def validate_aggregate_text_size(self) -> "BatchEvaluationRequest":
+        text_chars = sum(
+            len(item.prompt_text or "") + len(item.response_text or "")
+            for item in self.items
+        )
+        if text_chars > MAX_BATCH_TEXT_CHARS:
+            raise ValueError(
+                "Combined prompt_text and response_text in a batch must not exceed "
+                f"{MAX_BATCH_TEXT_CHARS} characters."
+            )
+        return self
 
 
 class BatchEvaluationResponse(BaseModel):

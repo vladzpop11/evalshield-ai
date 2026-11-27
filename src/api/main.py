@@ -75,6 +75,8 @@ _router: ChampionChallengerRouter | None = None
 _pii_detector: PIIDetector | None = None
 _api_auth_config = APIAuthConfig.from_env()
 
+MAX_REQUEST_BODY_BYTES = 1024 * 1024
+
 
 def cors_origins_from_env(environ: dict[str, str] | None = None) -> list[str]:
     """Read exact browser origins allowed to call this API cross-origin."""
@@ -114,6 +116,76 @@ def add_api_cors_middleware(app: FastAPI, origins: list[str]) -> None:
         allow_methods=["GET", "POST"],
         allow_headers=["Content-Type"],
     )
+
+
+class RequestBodyLimitMiddleware:
+    """Buffer at most the limit, replay valid bodies, and reject larger streams."""
+
+    def __init__(self, app, max_body_bytes: int) -> None:
+        self.app = app
+        self.max_body_bytes = max_body_bytes
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        content_lengths = [
+            value
+            for name, value in scope.get("headers", [])
+            if name.lower() == b"content-length"
+        ]
+        for raw_length in content_lengths:
+            try:
+                if int(raw_length) > self.max_body_bytes:
+                    await self._send_too_large(scope, receive, send)
+                    return
+            except ValueError:
+                # Invalid or ambiguous lengths do not bypass streamed byte counting.
+                continue
+
+        body = bytearray()
+        request_complete = False
+        while not request_complete:
+            message = await receive()
+            if message["type"] == "http.disconnect":
+                await self.app(scope, receive, send)
+                return
+            if message["type"] != "http.request":
+                continue
+
+            chunk = message.get("body", b"")
+            if len(body) + len(chunk) > self.max_body_bytes:
+                body.clear()
+                del message, chunk
+                await self._send_too_large(scope, receive, send)
+                return
+            body.extend(chunk)
+            request_complete = not message.get("more_body", False)
+
+        body_bytes = bytes(body)
+        del body
+        replayed = False
+
+        async def replay_receive():
+            nonlocal replayed
+            if not replayed:
+                replayed = True
+                return {"type": "http.request", "body": body_bytes, "more_body": False}
+            return await receive()
+
+        await self.app(scope, replay_receive, send)
+
+    async def _send_too_large(self, scope, receive, send) -> None:
+        headers = {}
+        if scope.get("http_version") in {"1.0", "1.1"}:
+            headers["Connection"] = "close"
+        response = JSONResponse(
+            status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+            content={"detail": "Request body exceeds the 1 MiB limit."},
+            headers=headers,
+        )
+        await response(scope, receive, send)
 
 # Thread-safe LRU evaluation cache (up to 512 recent decisions)
 _eval_cache: OrderedDict[str, dict] = OrderedDict()
@@ -313,6 +385,9 @@ app = FastAPI(
 )
 app.state.api_auth_config = _api_auth_config
 
+# Middleware insertion order is intentional: the size limiter is inside CORS,
+# while the timing/security-header middleware registered below wraps both.
+app.add_middleware(RequestBodyLimitMiddleware, max_body_bytes=MAX_REQUEST_BODY_BYTES)
 add_api_cors_middleware(app, cors_origins_from_env())
 
 

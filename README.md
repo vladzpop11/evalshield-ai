@@ -259,6 +259,10 @@ The API reads these environment variables when the application is imported:
 
 Only `GET /health` remains public. All other API operations require `Authorization: Bearer <token>`. Swagger, ReDoc, and OpenAPI routes are available only when authentication is disabled (the default demo setup).
 
+### Request and batch limits
+
+The API rejects request bodies larger than 1 MiB, including requests sent directly to port 8000. The frontend Nginx proxy applies the same 1 MiB limit as an additional boundary; API enforcement remains authoritative. Individual prompt and response fields remain limited to 65,536 characters. Evaluation batches accept 1–100 items and at most 524,288 combined prompt/response characters. Each evaluation may include up to 100 canary tokens, with each token limited to 256 characters.
+
 Generate a deployment key outside the repository and provide it through your secret manager or environment:
 
 API-key authentication does not encrypt traffic. Uvicorn's HTTP listener is not TLS protection: clients, including SDK clients, must use HTTPS whenever communication crosses an untrusted network. This repository does not provide TLS termination. In production, terminate TLS at a trusted reverse proxy, ingress, or equivalent infrastructure. HTTP between that boundary and Uvicorn is acceptable only over an appropriately trusted and isolated backend connection. Never expose the Uvicorn HTTP listener directly to an untrusted network. The production command below is only an internal backend listener; setting the mode and key alone does not secure transport.
