@@ -11,7 +11,11 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from src.ml.drift_recalibration import DriftRecalibrationEngine, get_recalibration_engine
+from src.ml.drift_recalibration import (
+    MAX_RECALIBRATION_HISTORY_ENTRIES,
+    DriftRecalibrationEngine,
+    get_recalibration_engine,
+)
 
 
 @pytest.fixture
@@ -84,3 +88,51 @@ class TestDriftRecalibration:
 
         assert len(recal_engine.recalibration_history) == initial_history_len + 1
         assert recal_engine.recalibration_history[-1].recalibration_id == res.recalibration_id
+
+    def test_recalibration_history_retains_only_newest_results(self, recal_engine):
+        """History retention applies to all results, including empty and undersized inputs."""
+        engine = DriftRecalibrationEngine(baseline_df=recal_engine._get_baseline())
+        sample_marker = 7.123456789
+        oldest = engine.recalibrate({"token_entropy": [sample_marker]})
+
+        recent_results = []
+        for index in range(MAX_RECALIBRATION_HISTORY_ENTRIES + 1):
+            samples = {} if index % 2 == 0 else {"token_entropy": [sample_marker] * 14}
+            result = engine.recalibrate(samples)
+            assert result.recalibration_status == "STABLE_NO_RECALIBRATION_NEEDED"
+            assert result.samples_evaluated == 0
+            recent_results.append(result)
+
+        history = engine.recalibration_history
+        expected_ids = [
+            result.recalibration_id
+            for result in recent_results[-MAX_RECALIBRATION_HISTORY_ENTRIES:]
+        ]
+        assert isinstance(history, list)
+        assert len(history) == MAX_RECALIBRATION_HISTORY_ENTRIES
+        assert [result.recalibration_id for result in history] == expected_ids
+        assert oldest.recalibration_id not in expected_ids
+
+        result_data = history[-1].to_dict()
+        assert set(result_data) == {
+            "recalibration_id",
+            "recalibration_status",
+            "overall_drift_detected",
+            "features_recalibrated",
+            "previous_thresholds",
+            "adjusted_thresholds",
+            "canary_promotion_recommended",
+            "samples_evaluated",
+            "applied_at",
+        }
+        assert "production_samples" not in result_data
+        assert sample_marker not in result_data.values()
+
+        retained_ids = [result.recalibration_id for result in history]
+        engine.reset_to_defaults()
+        assert [result.recalibration_id for result in history] == retained_ids
+
+        recalibrated = engine.recalibrate({"token_entropy": [9.8] * 80})
+        assert recalibrated.recalibration_status == "RECALIBRATED"
+        assert len(history) == MAX_RECALIBRATION_HISTORY_ENTRIES
+        assert history[-1].recalibration_id == recalibrated.recalibration_id

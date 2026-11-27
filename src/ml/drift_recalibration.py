@@ -23,6 +23,9 @@ from scipy.stats import ks_2samp
 
 logger = logging.getLogger("evalshield_recalibration")
 
+# Retain only recent in-memory audit metadata to keep process memory bounded.
+MAX_RECALIBRATION_HISTORY_ENTRIES = 1_000
+
 
 @dataclass
 class RecalibrationResult:
@@ -129,6 +132,11 @@ class DriftRecalibrationEngine:
             applied_at=datetime.now(timezone.utc).isoformat(),
         )
 
+        history_overflow = (
+            len(self.recalibration_history) - MAX_RECALIBRATION_HISTORY_ENTRIES + 1
+        )
+        if history_overflow > 0:
+            del self.recalibration_history[:history_overflow]
         self.recalibration_history.append(result)
         return result
 
