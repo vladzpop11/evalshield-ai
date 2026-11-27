@@ -20,12 +20,14 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import threading
 import time
 from collections import OrderedDict, deque
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, AsyncGenerator, Deque, Dict, List, Optional, Tuple
+from urllib.parse import urlsplit
 
 import numpy as np
 import pandas as pd
@@ -72,6 +74,46 @@ _extractor: TextFeatureExtractor | None = None
 _router: ChampionChallengerRouter | None = None
 _pii_detector: PIIDetector | None = None
 _api_auth_config = APIAuthConfig.from_env()
+
+
+def cors_origins_from_env(environ: dict[str, str] | None = None) -> list[str]:
+    """Read exact browser origins allowed to call this API cross-origin."""
+    values = os.environ if environ is None else environ
+    raw_origins = values.get("EVALSHIELD_CORS_ORIGINS", "")
+    origins: list[str] = []
+    for candidate in raw_origins.split(","):
+        origin = candidate.strip()
+        if not origin:
+            continue
+        parsed = urlsplit(origin)
+        if (
+            "*" in origin
+            or parsed.scheme not in {"http", "https"}
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.path
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise RuntimeError(
+                "EVALSHIELD_CORS_ORIGINS must contain exact http(s) origins "
+                "without paths or wildcards."
+            )
+        if origin not in origins:
+            origins.append(origin)
+    return origins
+
+
+def add_api_cors_middleware(app: FastAPI, origins: list[str]) -> None:
+    """Install the minimal CORS policy used by browser dashboard requests."""
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=origins,
+        allow_credentials=False,
+        allow_methods=["GET", "POST"],
+        allow_headers=["Content-Type"],
+    )
 
 # Thread-safe LRU evaluation cache (up to 512 recent decisions)
 _eval_cache: OrderedDict[str, dict] = OrderedDict()
@@ -271,13 +313,7 @@ app = FastAPI(
 )
 app.state.api_auth_config = _api_auth_config
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+add_api_cors_middleware(app, cors_origins_from_env())
 
 
 @app.exception_handler(RequestValidationError)

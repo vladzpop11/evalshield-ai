@@ -284,12 +284,12 @@ client = EvalShieldClient(
 
 ### Step 4: Open the Web UI Dashboard
 
-The Docker Compose/Nginx dashboard uses same-origin API routes by default. To run the static dashboard without an API proxy, explicitly enable its client-side simulation mode:
+The Docker Compose/Nginx dashboard uses same-origin API routes by default and does not need CORS configuration. To run the static dashboard without an API proxy, explicitly enable its client-side simulation mode:
 
 ```bash
 python3 -m http.server 8080
 ```
-Visit [http://localhost:8080/index.html?mode=simulation](http://localhost:8080/index.html?mode=simulation). Simulation results are generated in the browser and are not server evaluations. For standalone local API-backed development, set the `evalshield-api-base` meta tag in `index.html` to `http://127.0.0.1:8000`; this is a public endpoint setting, not a place for credentials.
+Visit [http://localhost:8080/index.html?mode=simulation](http://localhost:8080/index.html?mode=simulation). Simulation results are generated in the browser and are not server evaluations. For standalone local API-backed development, set the `evalshield-api-base` meta tag in `index.html` to `http://127.0.0.1:8000`; this is a public endpoint setting, not a place for credentials. Since this setup is cross-origin, set `EVALSHIELD_CORS_ORIGINS=http://localhost:8080` before starting the API. The API allows only explicitly listed exact origins; the default is no cross-origin access. CORS is not authentication, and the Python SDK does not require CORS.
 
 ---
 
