@@ -2,15 +2,49 @@
 
 from __future__ import annotations
 
+import math
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from src.ml.model_generator import FEATURE_NAMES
 
 
 MAX_BATCH_ITEMS = 100
 MAX_BATCH_TEXT_CHARS = 512 * 1024
 MAX_CANARY_TOKEN_CHARS = 256
+MAX_DRIFT_SAMPLES_PER_FEATURE = 4_000
+MAX_DRIFT_SAMPLES_TOTAL = 20_000
+
+FEATURE_SAMPLE_RANGES = {
+    "toxicity_score": (0.0, 1.0),
+    "hallucination_risk": (0.0, 1.0),
+    "prompt_injection_score": (0.0, 1.0),
+    "semantic_drift": (0.0, 1.0),
+    "token_entropy": (0.0, 10.0),
+}
+
+
+def _validate_feature_samples(samples: Dict[str, List[float]]) -> Dict[str, List[float]]:
+    """Validate bounded, finite samples for the model's actual feature set."""
+    total_samples = sum(len(values) for values in samples.values())
+    if total_samples > MAX_DRIFT_SAMPLES_TOTAL:
+        raise ValueError(f"At most {MAX_DRIFT_SAMPLES_TOTAL} samples are allowed per request")
+
+    unknown_features = set(samples) - set(FEATURE_NAMES)
+    if unknown_features:
+        raise ValueError("Only model feature names are allowed")
+
+    for feature_name, values in samples.items():
+        if len(values) > MAX_DRIFT_SAMPLES_PER_FEATURE:
+            raise ValueError(
+                f"At most {MAX_DRIFT_SAMPLES_PER_FEATURE} samples are allowed per feature"
+            )
+        lower, upper = FEATURE_SAMPLE_RANGES[feature_name]
+        if any(not math.isfinite(value) or value < lower or value > upper for value in values):
+            raise ValueError(f"Samples for {feature_name} must be finite and within [{lower}, {upper}]")
+
+    return samples
 
 
 class EvaluationRequest(BaseModel):
@@ -192,9 +226,16 @@ class ModelMetadataResponse(BaseModel):
 class DriftCheckRequest(BaseModel):
     """Request payload containing sample feature distributions to compare against the baseline."""
     feature_samples: Dict[str, List[float]] = Field(
-        ..., description="Map of feature names to observed numeric value lists"
+        ...,
+        max_length=len(FEATURE_NAMES),
+        description="Map of model feature names to bounded observed numeric value lists",
     )
     significance_level: float = Field(default=0.05, ge=0.001, le=0.20)
+
+    @field_validator("feature_samples")
+    @classmethod
+    def validate_feature_samples(cls, samples: Dict[str, List[float]]) -> Dict[str, List[float]]:
+        return _validate_feature_samples(samples)
 
 
 class DriftFeatureResult(BaseModel):
@@ -219,9 +260,16 @@ class DriftCheckResponse(BaseModel):
 class RecalibrateRequest(BaseModel):
     """Payload to trigger closed-loop drift recalibration."""
     production_samples: Dict[str, List[float]] = Field(
-        ..., description="Recent observed production samples per feature"
+        ...,
+        max_length=len(FEATURE_NAMES),
+        description="Recent bounded observed samples for model features",
     )
     significance_level: float = Field(default=0.05, ge=0.001, le=0.20)
+
+    @field_validator("production_samples")
+    @classmethod
+    def validate_production_samples(cls, samples: Dict[str, List[float]]) -> Dict[str, List[float]]:
+        return _validate_feature_samples(samples)
 
 
 class RecalibrateResponse(BaseModel):

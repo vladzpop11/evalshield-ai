@@ -183,7 +183,9 @@ class TestApiEndpoints:
         drift_payload = {
             "feature_samples": {
                 "token_entropy": rng.normal(loc=4.5, scale=1.8, size=50).tolist(),
-                "toxicity_score": rng.normal(loc=0.85, scale=0.1, size=50).tolist(),  # shifted
+                "toxicity_score": np.clip(
+                    rng.normal(loc=0.85, scale=0.1, size=50), 0.0, 1.0
+                ).tolist(),  # shifted and within the model feature range
             },
             "significance_level": 0.05,
         }
