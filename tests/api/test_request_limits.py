@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 
 import pytest
+from fastapi import FastAPI, Request
 from httpx import ASGITransport, AsyncClient
 
 from src.api import main as api_main
@@ -149,3 +151,199 @@ async def test_body_limit_does_not_remove_authentication_or_public_health(monkey
 
     assert protected.status_code == 401
     assert health.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_concurrent_body_admission_rejects_excess_and_recovers_after_success():
+    limit = 2
+    entered = 0
+    entered_lock = asyncio.Lock()
+    both_entered = asyncio.Event()
+    release = asyncio.Event()
+    inner_app = FastAPI()
+
+    @inner_app.post("/{mode}")
+    async def endpoint(mode: str, request: Request):
+        nonlocal entered
+        body = await request.body()
+        if mode == "hold":
+            async with entered_lock:
+                entered += 1
+                if entered == limit:
+                    both_entered.set()
+            await release.wait()
+        return {"body_size": len(body)}
+
+    middleware = api_main.RequestBodyLimitMiddleware(
+        inner_app,
+        max_body_bytes=8,
+        max_concurrent_requests=limit,
+    )
+    async with AsyncClient(
+        transport=ASGITransport(app=middleware), base_url="http://testserver"
+    ) as client:
+        admitted = [
+            asyncio.create_task(client.post("/hold", content=b"one")),
+            asyncio.create_task(client.post("/hold", content=b"two")),
+        ]
+        try:
+            await asyncio.wait_for(both_entered.wait(), timeout=2)
+            rejected = await asyncio.wait_for(
+                client.post("/hold", content=b"excess"), timeout=1
+            )
+            assert rejected.status_code == 503
+            assert rejected.json() == {
+                "detail": "Too many requests are being processed. Retry shortly."
+            }
+            assert rejected.headers["retry-after"] == "1"
+            assert rejected.headers["connection"] == "close"
+            assert entered == limit
+        finally:
+            release.set()
+
+        responses = await asyncio.gather(*admitted)
+        assert [response.status_code for response in responses] == [200, 200]
+
+        # Repeated requests after both completions prove no admission slots leaked.
+        for _ in range(20):
+            response = await client.post("/ok", content=b"ok")
+            assert response.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_body_admission_slots_release_after_exception_oversize_and_cancellation():
+    cancel_started = asyncio.Event()
+    never_release = asyncio.Event()
+    inner_app = FastAPI()
+
+    @inner_app.post("/{mode}")
+    async def endpoint(mode: str, request: Request):
+        body = await request.body()
+        if mode == "raise":
+            raise RuntimeError("controlled endpoint failure")
+        if mode == "cancel":
+            cancel_started.set()
+            await never_release.wait()
+        return {"body_size": len(body)}
+
+    middleware = api_main.RequestBodyLimitMiddleware(
+        inner_app,
+        max_body_bytes=4,
+        max_concurrent_requests=1,
+    )
+    async with AsyncClient(
+        transport=ASGITransport(app=middleware, raise_app_exceptions=False),
+        base_url="http://testserver",
+    ) as client:
+        oversized = await client.post("/ok", content=b"12345")
+        assert oversized.status_code == 413
+        assert (await client.post("/ok", content=b"1234")).status_code == 200
+
+        failed = await client.post("/raise", content=b"x")
+        assert failed.status_code == 500
+        assert (await client.post("/ok", content=b"x")).status_code == 200
+
+        cancelled_request = asyncio.create_task(client.post("/cancel", content=b"x"))
+        await asyncio.wait_for(cancel_started.wait(), timeout=2)
+        cancelled_request.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await cancelled_request
+
+        # The permit is released from finally even when downstream is cancelled.
+        recovered = await client.post("/ok", content=b"x")
+        assert recovered.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_disconnect_releases_body_admission_slot():
+    async def responding_app(scope, receive, send):
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"ok"})
+
+    middleware = api_main.RequestBodyLimitMiddleware(
+        responding_app,
+        max_body_bytes=4,
+        max_concurrent_requests=1,
+    )
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0", "spec_version": "2.3"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/request",
+        "raw_path": b"/request",
+        "query_string": b"",
+        "headers": [],
+        "server": ("testserver", 80),
+        "client": ("testclient", 1234),
+    }
+
+    async def disconnected_receive():
+        return {"type": "http.disconnect"}
+
+    async def request_receive():
+        return {"type": "http.request", "body": b"x", "more_body": False}
+
+    async def run_request(receive):
+        sent = []
+
+        async def send(message):
+            sent.append(message)
+
+        await middleware(scope, receive, send)
+        return sent
+
+    disconnected_response = await run_request(disconnected_receive)
+    assert disconnected_response[0]["status"] == 200
+    normal_response = await run_request(request_receive)
+    assert normal_response[0]["status"] == 200
+
+
+@pytest.mark.asyncio
+async def test_full_admission_returns_safe_503_before_auth_and_keeps_health_available(
+    api_client, monkeypatch
+):
+    monkeypatch.setitem(
+        api_main.app.state._state,
+        "api_auth_config",
+        APIAuthConfig(mode="production", api_key="k" * 40),
+    )
+    # Build Starlette's middleware stack and locate the production limiter.
+    assert (await api_client.get("/health")).status_code == 200
+    current = api_main.app.middleware_stack
+    body_limiter = None
+    while current is not None:
+        if isinstance(current, api_main.RequestBodyLimitMiddleware):
+            body_limiter = current
+            break
+        current = getattr(current, "app", None)
+    assert body_limiter is not None
+
+    acquired = 0
+    for _ in range(api_main.MAX_CONCURRENT_BUFFERED_REQUESTS):
+        assert body_limiter._admission_slots.acquire(blocking=False)
+        acquired += 1
+
+    try:
+        # Admission happens before route-level authentication, including for an
+        # unauthenticated request, while the bodyless public health probe bypasses it.
+        overloaded = await api_client.post("/evaluate", json=metric_item())
+        health = await api_client.get("/health")
+    finally:
+        for _ in range(acquired):
+            body_limiter._admission_slots.release()
+
+    assert overloaded.status_code == 503
+    assert overloaded.json() == {
+        "detail": "Too many requests are being processed. Retry shortly."
+    }
+    assert overloaded.headers["retry-after"] == "1"
+    assert overloaded.headers["x-content-type-options"] == "nosniff"
+    assert overloaded.headers["x-frame-options"] == "DENY"
+    assert health.status_code == 200
+
+    # Once capacity is restored, the same request reaches auth and is rejected
+    # with the existing 401 behavior rather than being admitted anonymously.
+    unauthenticated = await api_client.post("/evaluate", json=metric_item())
+    assert unauthenticated.status_code == 401

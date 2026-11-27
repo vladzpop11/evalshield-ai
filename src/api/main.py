@@ -76,6 +76,9 @@ _pii_detector: PIIDetector | None = None
 _api_auth_config = APIAuthConfig.from_env()
 
 MAX_REQUEST_BODY_BYTES = 1024 * 1024
+# One API worker and 1 MiB per request: cap simultaneously buffered request
+# bodies at 16 (16 MiB of raw bodies before parser and temporary-copy overhead).
+MAX_CONCURRENT_BUFFERED_REQUESTS = 16
 
 
 def cors_origins_from_env(environ: dict[str, str] | None = None) -> list[str]:
@@ -119,17 +122,61 @@ def add_api_cors_middleware(app: FastAPI, origins: list[str]) -> None:
 
 
 class RequestBodyLimitMiddleware:
-    """Buffer at most the limit, replay valid bodies, and reject larger streams."""
+    """Bound concurrent body buffering and bytes, then replay accepted bodies."""
 
-    def __init__(self, app, max_body_bytes: int) -> None:
+    def __init__(
+        self,
+        app,
+        max_body_bytes: int,
+        max_concurrent_requests: int = MAX_CONCURRENT_BUFFERED_REQUESTS,
+    ) -> None:
+        if (
+            not isinstance(max_concurrent_requests, int)
+            or isinstance(max_concurrent_requests, bool)
+            or max_concurrent_requests < 1
+        ):
+            raise ValueError("max_concurrent_requests must be a positive integer")
         self.app = app
         self.max_body_bytes = max_body_bytes
+        self.max_concurrent_requests = max_concurrent_requests
+        self._admission_slots = threading.BoundedSemaphore(max_concurrent_requests)
 
     async def __call__(self, scope, receive, send) -> None:
         if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
 
+        # Normal health probes have no body and need not wait for a body-buffer
+        # slot. Any body-bearing health request still uses the normal limits.
+        if self._is_bodyless_health_probe(scope):
+            await self.app(scope, receive, send)
+            return
+
+        if not self._admission_slots.acquire(blocking=False):
+            await self._send_overloaded(scope, receive, send)
+            return
+
+        try:
+            await self._buffer_and_call(scope, receive, send)
+        finally:
+            self._admission_slots.release()
+
+    @staticmethod
+    def _is_bodyless_health_probe(scope) -> bool:
+        if (
+            scope.get("method") != "GET"
+            or scope.get("path") != "/health"
+            or scope.get("http_version") not in {"1.0", "1.1"}
+        ):
+            return False
+        for name, value in scope.get("headers", []):
+            if name.lower() == b"transfer-encoding":
+                return False
+            if name.lower() == b"content-length" and value.strip() != b"0":
+                return False
+        return True
+
+    async def _buffer_and_call(self, scope, receive, send) -> None:
         content_lengths = [
             value
             for name, value in scope.get("headers", [])
@@ -175,6 +222,17 @@ class RequestBodyLimitMiddleware:
             return await receive()
 
         await self.app(scope, replay_receive, send)
+
+    async def _send_overloaded(self, scope, receive, send) -> None:
+        headers = {"Retry-After": "1"}
+        if scope.get("http_version") in {"1.0", "1.1"}:
+            headers["Connection"] = "close"
+        response = JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content={"detail": "Too many requests are being processed. Retry shortly."},
+            headers=headers,
+        )
+        await response(scope, receive, send)
 
     async def _send_too_large(self, scope, receive, send) -> None:
         headers = {}
@@ -387,7 +445,11 @@ app.state.api_auth_config = _api_auth_config
 
 # Middleware insertion order is intentional: the size limiter is inside CORS,
 # while the timing/security-header middleware registered below wraps both.
-app.add_middleware(RequestBodyLimitMiddleware, max_body_bytes=MAX_REQUEST_BODY_BYTES)
+app.add_middleware(
+    RequestBodyLimitMiddleware,
+    max_body_bytes=MAX_REQUEST_BODY_BYTES,
+    max_concurrent_requests=MAX_CONCURRENT_BUFFERED_REQUESTS,
+)
 add_api_cors_middleware(app, cors_origins_from_env())
 
 
