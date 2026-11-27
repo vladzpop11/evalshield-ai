@@ -204,6 +204,8 @@ class TestApiEndpoints:
         assert "evalshield_requests_total" in body
         assert "evalshield_cache_hits_total" in body
         assert "evalshield_shadow_evaluations_total" in body
+        assert "evalshield_shadow_jobs_skipped_total" in body
+        assert "evalshield_shadow_jobs_outstanding" in body
         assert "evalshield_latency_milliseconds" in body
         assert "evalshield_uptime_seconds" in body
 

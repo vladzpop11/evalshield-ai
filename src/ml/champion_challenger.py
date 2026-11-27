@@ -17,7 +17,7 @@ import random
 import threading
 import time
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Deque, Dict, List, Optional
@@ -27,9 +27,13 @@ from .model_generator import FEATURE_NAMES
 
 logger = logging.getLogger("evalshield_shadow_router")
 
+# Allows one maximum-size batch to be shadowed while bounding queued and running
+# work to a fixed number of evaluations per API process.
+DEFAULT_MAX_OUTSTANDING_SHADOW_JOBS = 100
+
 
 class ChampionChallengerRouter:
-    """Production Champion/Challenger Router with async shadow evaluation."""
+    """Production Champion/Challenger Router with bounded async shadow evaluation."""
 
     def __init__(
         self,
@@ -38,6 +42,7 @@ class ChampionChallengerRouter:
         shadow_traffic_rate: Optional[float] = None,
         risk_delta_threshold: float = 0.15,
         max_workers: int = 2,
+        max_outstanding_shadow_jobs: int = DEFAULT_MAX_OUTSTANDING_SHADOW_JOBS,
     ) -> None:
         self.artifacts_dir = Path(__file__).resolve().parent / "artifacts"
 
@@ -66,6 +71,13 @@ class ChampionChallengerRouter:
             self.shadow_traffic_rate = float(os.getenv("SHADOW_TRAFFIC_RATE", "1.0"))
 
         self.risk_delta_threshold = risk_delta_threshold
+        if (
+            not isinstance(max_outstanding_shadow_jobs, int)
+            or isinstance(max_outstanding_shadow_jobs, bool)
+            or max_outstanding_shadow_jobs < 1
+        ):
+            raise ValueError("max_outstanding_shadow_jobs must be a positive integer")
+        self.max_outstanding_shadow_jobs = max_outstanding_shadow_jobs
 
         # Thread pool for asynchronous shadow execution
         self._executor = ThreadPoolExecutor(
@@ -77,6 +89,8 @@ class ChampionChallengerRouter:
         # Telemetry counters
         self._total_requests: int = 0
         self._shadow_evaluations: int = 0
+        self._shadow_jobs_outstanding: int = 0
+        self._shadow_jobs_skipped: int = 0
         self._discrepancy_count: int = 0
         self._decision_mismatch_count: int = 0
         self._risk_delta_breach_count: int = 0
@@ -109,14 +123,37 @@ class ChampionChallengerRouter:
         # Determine if this request qualifies for shadow evaluation
         if self.challenger is not None and self.shadow_traffic_rate > 0.0:
             if random.random() < self.shadow_traffic_rate:
-                self._executor.submit(
-                    self._execute_shadow_evaluation,
-                    features=dict(features),
-                    prompt_id=prompt_id,
-                    champ_result=dict(champ_res),
-                )
+                with self._lock:
+                    if self._shadow_jobs_outstanding >= self.max_outstanding_shadow_jobs:
+                        self._shadow_jobs_skipped += 1
+                        return champ_res
+                    self._shadow_jobs_outstanding += 1
+
+                try:
+                    future = self._executor.submit(
+                        self._execute_shadow_evaluation,
+                        features=dict(features),
+                        prompt_id=prompt_id,
+                        champ_result=dict(champ_res),
+                    )
+                except Exception:
+                    self._finish_shadow_job()
+                    with self._lock:
+                        self._shadow_jobs_skipped += 1
+                    logger.warning("Shadow evaluation could not be submitted; champion result retained.")
+                    return champ_res
+                future.add_done_callback(self._on_shadow_job_done)
 
         return champ_res
+
+    def _finish_shadow_job(self) -> None:
+        """Release one outstanding-work slot after any terminal future state."""
+        with self._lock:
+            self._shadow_jobs_outstanding -= 1
+
+    def _on_shadow_job_done(self, _future: Future[Any]) -> None:
+        """Release admission capacity when a shadow future completes or is cancelled."""
+        self._finish_shadow_job()
 
     def _execute_shadow_evaluation(
         self,
@@ -248,6 +285,8 @@ class ChampionChallengerRouter:
                 "risk_delta_threshold": self.risk_delta_threshold,
                 "total_production_requests": self._total_requests,
                 "shadow_evaluations_run": shadow_count,
+                "shadow_jobs_outstanding": self._shadow_jobs_outstanding,
+                "shadow_jobs_skipped": self._shadow_jobs_skipped,
                 "discrepancy_count": self._discrepancy_count,
                 "decision_mismatches": self._decision_mismatch_count,
                 "risk_delta_breaches": self._risk_delta_breach_count,
@@ -267,6 +306,7 @@ class ChampionChallengerRouter:
         with self._lock:
             self._total_requests = 0
             self._shadow_evaluations = 0
+            self._shadow_jobs_skipped = 0
             self._discrepancy_count = 0
             self._decision_mismatch_count = 0
             self._risk_delta_breach_count = 0

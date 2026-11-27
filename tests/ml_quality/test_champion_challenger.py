@@ -9,7 +9,9 @@ Validates:
 from __future__ import annotations
 
 import json
+import threading
 import time
+from concurrent.futures import Future
 from pathlib import Path
 from typing import Any, Dict
 from unittest.mock import MagicMock
@@ -195,3 +197,219 @@ class TestChampionChallengerRouter:
         assert stats_after["total_production_requests"] == 0
         assert stats_after["shadow_evaluations_run"] == 0
         router.shutdown()
+
+    def test_shadow_work_is_bounded_and_saturation_preserves_champion(
+        self,
+        benign_features: Dict[str, float],
+    ):
+        """Saturation skips shadow jobs without delaying or changing champion results."""
+        from src.ml.champion_challenger import DEFAULT_MAX_OUTSTANDING_SHADOW_JOBS
+
+        worker_started = threading.Event()
+        release_worker = threading.Event()
+        callbacks_lock = threading.Lock()
+        callbacks_completed = 0
+        initial_callbacks_completed = threading.Event()
+        third_callback_completed = threading.Event()
+
+        champion = MagicMock()
+        champion.backend = "onnx_int8"
+        champion.predict.return_value = {
+            "shield_decision": "ALLOWED",
+            "risk_score": 0.05,
+            "backend": "onnx_int8",
+            "latency_ms": 1.0,
+        }
+        challenger = MagicMock()
+        challenger.backend = "onnx"
+
+        def blocked_prediction(_features: Dict[str, float]) -> Dict[str, Any]:
+            worker_started.set()
+            assert release_worker.wait(timeout=3)
+            return {"shield_decision": "ALLOWED", "risk_score": 0.05, "latency_ms": 2.0}
+
+        challenger.predict.side_effect = blocked_prediction
+        router = ChampionChallengerRouter(
+            champion_engine=champion,
+            challenger_engine=challenger,
+            shadow_traffic_rate=1.0,
+            max_workers=1,
+            max_outstanding_shadow_jobs=2,
+        )
+        original_done_callback = router._on_shadow_job_done
+
+        def observe_completion(future: Future[Any]) -> None:
+            nonlocal callbacks_completed
+            original_done_callback(future)
+            with callbacks_lock:
+                callbacks_completed += 1
+                if callbacks_completed >= 2:
+                    initial_callbacks_completed.set()
+                if callbacks_completed >= 3:
+                    third_callback_completed.set()
+
+        router._on_shadow_job_done = observe_completion  # type: ignore[method-assign]
+
+        try:
+            first = router.route_and_evaluate(benign_features, prompt_id="first")
+            assert first["shield_decision"] == "ALLOWED"
+            assert worker_started.wait(timeout=2)
+
+            second = router.route_and_evaluate(benign_features, prompt_id="second")
+            assert second["shield_decision"] == "ALLOWED"
+
+            # More attempts than the cap are immediately skipped while one job
+            # runs and one waits in the executor's queue.
+            for index in range(DEFAULT_MAX_OUTSTANDING_SHADOW_JOBS * 2):
+                result = router.route_and_evaluate(benign_features, prompt_id=f"saturated-{index}")
+                assert result["shield_decision"] == "ALLOWED"
+                stats = router.get_shadow_stats()
+                assert stats["shadow_jobs_outstanding"] <= 2
+
+            saturated_stats = router.get_shadow_stats()
+            assert saturated_stats["shadow_jobs_outstanding"] == 2
+            assert saturated_stats["shadow_jobs_skipped"] == DEFAULT_MAX_OUTSTANDING_SHADOW_JOBS * 2
+            assert champion.predict.call_count == 2 + DEFAULT_MAX_OUTSTANDING_SHADOW_JOBS * 2
+
+            release_worker.set()
+            assert initial_callbacks_completed.wait(timeout=3)
+            assert router.get_shadow_stats()["shadow_jobs_outstanding"] == 0
+
+            # Capacity is available again after completion.
+            after_release = router.route_and_evaluate(benign_features, prompt_id="after-release")
+            assert after_release["shield_decision"] == "ALLOWED"
+            assert third_callback_completed.wait(timeout=3)
+            assert router.get_shadow_stats()["shadow_jobs_outstanding"] == 0
+        finally:
+            release_worker.set()
+            router.shutdown(wait=True)
+
+    def test_shadow_capacity_is_restored_after_worker_failure(
+        self,
+        benign_features: Dict[str, float],
+    ):
+        """A failed submitted future releases its admission slot."""
+        completed = threading.Event()
+        champion = MagicMock()
+        champion.backend = "onnx_int8"
+        champion.predict.return_value = {
+            "shield_decision": "ALLOWED",
+            "risk_score": 0.05,
+            "backend": "onnx_int8",
+            "latency_ms": 1.0,
+        }
+        challenger = MagicMock()
+        challenger.backend = "onnx"
+        challenger.predict.side_effect = RuntimeError("controlled worker failure")
+        router = ChampionChallengerRouter(
+            champion_engine=champion,
+            challenger_engine=challenger,
+            shadow_traffic_rate=1.0,
+            max_outstanding_shadow_jobs=1,
+        )
+        original_done_callback = router._on_shadow_job_done
+
+        def observe_completion(future: Future[Any]) -> None:
+            original_done_callback(future)
+            completed.set()
+
+        router._on_shadow_job_done = observe_completion  # type: ignore[method-assign]
+
+        try:
+            result = router.route_and_evaluate(benign_features, prompt_id="failure")
+            assert result["shield_decision"] == "ALLOWED"
+            assert completed.wait(timeout=2)
+            stats = router.get_shadow_stats()
+            assert stats["shadow_jobs_outstanding"] == 0
+            assert stats["shadow_jobs_skipped"] == 0
+            assert challenger.predict.call_count == 1
+
+            completed.clear()
+            challenger.predict.side_effect = None
+            challenger.predict.return_value = {
+                "shield_decision": "ALLOWED",
+                "risk_score": 0.05,
+                "latency_ms": 2.0,
+            }
+            retry_result = router.route_and_evaluate(benign_features, prompt_id="after-failure")
+            assert retry_result["shield_decision"] == "ALLOWED"
+            assert completed.wait(timeout=2)
+            assert challenger.predict.call_count == 2
+            assert router.get_shadow_stats()["shadow_jobs_outstanding"] == 0
+            assert router.get_shadow_stats()["shadow_jobs_skipped"] == 0
+        finally:
+            router.shutdown(wait=True)
+
+    def test_shadow_capacity_is_restored_after_cancellation(
+        self,
+        benign_features: Dict[str, float],
+    ):
+        """Cancellation of a queued shadow future releases its reserved slot."""
+
+        class PendingExecutor:
+            def __init__(self) -> None:
+                self.future: Future[None] = Future()
+
+            def submit(self, *_args: Any, **_kwargs: Any) -> Future[None]:
+                return self.future
+
+            def shutdown(self, **_kwargs: Any) -> None:
+                return None
+
+        champion = MagicMock()
+        champion.backend = "onnx_int8"
+        champion.predict.return_value = {
+            "shield_decision": "ALLOWED",
+            "risk_score": 0.05,
+            "backend": "onnx_int8",
+            "latency_ms": 1.0,
+        }
+        challenger = MagicMock()
+        challenger.backend = "onnx"
+        router = ChampionChallengerRouter(
+            champion_engine=champion,
+            challenger_engine=challenger,
+            shadow_traffic_rate=1.0,
+            max_outstanding_shadow_jobs=1,
+        )
+        router._executor.shutdown(wait=True)
+        pending_executor = PendingExecutor()
+        router._executor = pending_executor  # type: ignore[assignment]
+
+        try:
+            result = router.route_and_evaluate(benign_features, prompt_id="cancel")
+            assert result["shield_decision"] == "ALLOWED"
+            assert router.get_shadow_stats()["shadow_jobs_outstanding"] == 1
+            assert pending_executor.future.cancel()
+            assert router.get_shadow_stats()["shadow_jobs_outstanding"] == 0
+        finally:
+            router.shutdown(wait=True)
+
+    def test_shadow_submission_failure_releases_capacity_and_preserves_champion(
+        self,
+        benign_features: Dict[str, float],
+    ):
+        """Executor shutdown races do not fail the authoritative evaluation."""
+        champion = MagicMock()
+        champion.backend = "onnx_int8"
+        champion.predict.return_value = {
+            "shield_decision": "ALLOWED",
+            "risk_score": 0.05,
+            "backend": "onnx_int8",
+            "latency_ms": 1.0,
+        }
+        challenger = MagicMock()
+        challenger.backend = "onnx"
+        router = ChampionChallengerRouter(
+            champion_engine=champion,
+            challenger_engine=challenger,
+            shadow_traffic_rate=1.0,
+            max_outstanding_shadow_jobs=1,
+        )
+        router.shutdown(wait=True)
+
+        result = router.route_and_evaluate(benign_features, prompt_id="submit-failure")
+        stats = router.get_shadow_stats()
+        assert result["shield_decision"] == "ALLOWED"
+        assert stats["shadow_jobs_outstanding"] == 0
+        assert stats["shadow_jobs_skipped"] == 1
