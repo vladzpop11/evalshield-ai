@@ -353,6 +353,8 @@ The API runs in its default anonymous demo mode. The published API and frontend 
 
 The API container runs one Uvicorn worker because its cache, telemetry, router, and recalibration state are process-local. Increasing the worker count without moving relevant state to shared infrastructure would make operational state inconsistent across requests. Multi-worker deployment requires shared-state infrastructure or an architectural change.
 
+The local/demo Compose stack applies per-container limits: API 2 CPUs, 1536 MiB memory, and 128 PIDs; frontend 0.5 CPU, 128 MiB memory, and 64 PIDs. These are containment defaults, not validated production capacity requirements. CPU limits can throttle API inference and other work. If a container exceeds its memory limit, Docker may terminate it; API termination resets its process-local cache, telemetry, router, and recalibration state. Validate and size limits for the actual production workload separately.
+
 ```bash
 docker compose -f docker/docker-compose.yml up --build -d
 ```

@@ -10,6 +10,9 @@ services:
       - PORT=8000
       - ORT_NUM_THREADS=2
       - MLFLOW_TRACKING_URI=file:///app/src/ml/artifacts/mlruns
+    cpus: 2.0
+    mem_limit: 1536m
+    pids_limit: 128
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 10s
@@ -30,6 +33,9 @@ services:
       context: ..
       dockerfile: docker/Dockerfile.frontend
     container_name: evalshield-frontend
+    cpus: 0.5
+    mem_limit: 128m
+    pids_limit: 64
     ports:
       - "127.0.0.1:8080:8080"
     depends_on:
