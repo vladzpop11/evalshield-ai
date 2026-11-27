@@ -24,6 +24,7 @@ import os
 import threading
 import time
 from collections import OrderedDict, deque
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, AsyncGenerator, Deque, Dict, List, Optional, Tuple
@@ -79,6 +80,9 @@ MAX_REQUEST_BODY_BYTES = 1024 * 1024
 # One API worker and 1 MiB per request: cap simultaneously buffered request
 # bodies at 16 (16 MiB of raw bodies before parser and temporary-copy overhead).
 MAX_CONCURRENT_BUFFERED_REQUESTS = 16
+# Keep CPU/blocking operations serialized as they were on the single event loop,
+# but execute them off-loop and reject rather than queueing behind a busy worker.
+MAX_CONCURRENT_EXPENSIVE_OPERATIONS = 1
 
 
 def cors_origins_from_env(environ: dict[str, str] | None = None) -> list[str]:
@@ -244,6 +248,111 @@ class RequestBodyLimitMiddleware:
             headers=headers,
         )
         await response(scope, receive, send)
+
+
+class BoundedSyncExecutor:
+    """Offload synchronous work with no wait queue beyond active workers."""
+
+    def __init__(self, max_workers: int = MAX_CONCURRENT_EXPENSIVE_OPERATIONS) -> None:
+        if (
+            not isinstance(max_workers, int)
+            or isinstance(max_workers, bool)
+            or max_workers < 1
+        ):
+            raise ValueError("max_workers must be a positive integer")
+        self.max_workers = max_workers
+        self._executor = ThreadPoolExecutor(
+            max_workers=max_workers,
+            thread_name_prefix="evalshield_api_work",
+        )
+        self._slots = threading.BoundedSemaphore(max_workers)
+        self._lifecycle_lock = threading.Lock()
+        self._shutdown = False
+
+    def try_submit(self, function, /, *args, **kwargs) -> Optional[Future[Any]]:
+        """Submit only when an execution slot is immediately available."""
+        if not self._slots.acquire(blocking=False):
+            return None
+
+        try:
+            with self._lifecycle_lock:
+                if self._shutdown:
+                    self._slots.release()
+                    return None
+                future = self._executor.submit(function, *args, **kwargs)
+        except Exception:
+            self._slots.release()
+            logger.warning("Synchronous API work could not be submitted.")
+            return None
+
+        # Release from the concurrent future itself. Request cancellation must
+        # not make a still-running thread appear idle to the admission gate.
+        future.add_done_callback(lambda _future: self._slots.release())
+        return future
+
+    async def wait(self, future: Future[Any]) -> Any:
+        """Await a worker without propagating request cancellation into it."""
+        wrapped = asyncio.wrap_future(future)
+        wrapped.add_done_callback(self._consume_async_exception)
+        return await asyncio.shield(wrapped)
+
+    @staticmethod
+    def _consume_async_exception(future: asyncio.Future[Any]) -> None:
+        # If the request is cancelled, the shielded worker may finish later.
+        # Retrieve any exception so it does not become an unobserved-future log.
+        if not future.cancelled():
+            future.exception()
+
+    def shutdown(self, wait: bool = True) -> None:
+        with self._lifecycle_lock:
+            if self._shutdown:
+                return
+            self._shutdown = True
+        self._executor.shutdown(wait=wait, cancel_futures=True)
+
+
+_expensive_executor: Optional[BoundedSyncExecutor] = None
+_expensive_executor_lock = threading.Lock()
+
+
+def get_expensive_executor() -> BoundedSyncExecutor:
+    """Return the process-local bounded executor, creating it lazily."""
+    global _expensive_executor
+    with _expensive_executor_lock:
+        if _expensive_executor is None:
+            _expensive_executor = BoundedSyncExecutor()
+        return _expensive_executor
+
+
+async def _run_expensive(function, /, *args, **kwargs) -> Any:
+    executor = get_expensive_executor()
+    future = executor.try_submit(function, *args, **kwargs)
+    if future is None:
+        raise _expensive_work_unavailable()
+    return await executor.wait(future)
+
+
+def _expensive_work_unavailable() -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail="Server is busy processing another resource-intensive operation. Retry shortly.",
+        headers={"Retry-After": "1"},
+    )
+
+
+async def _shutdown_expensive_executor() -> None:
+    global _expensive_executor
+    with _expensive_executor_lock:
+        executor = _expensive_executor
+    if executor is not None:
+        # Wait outside the event loop for any cancellation-shielded worker to
+        # finish; its Future callback releases the outstanding slot meanwhile.
+        # Keep the shut-down executor published until then so requests arriving
+        # during graceful shutdown are rejected instead of creating a second pool.
+        await asyncio.to_thread(executor.shutdown, True)
+        with _expensive_executor_lock:
+            if _expensive_executor is executor:
+                _expensive_executor = None
 
 # Thread-safe LRU evaluation cache (up to 512 recent decisions)
 _eval_cache: OrderedDict[str, dict] = OrderedDict()
@@ -426,8 +535,11 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     get_pii()
     get_baseline_df()
     logger.info("EvalShield-AI ready. Champion/Challenger shadow router & PII engine active.")
-    yield
-    logger.info("EvalShield-AI graceful shutdown complete.")
+    try:
+        yield
+    finally:
+        await _shutdown_expensive_executor()
+        logger.info("EvalShield-AI graceful shutdown complete.")
 
 
 app = FastAPI(
@@ -786,12 +898,8 @@ async def evaluate_single(payload: EvaluationRequest) -> EvaluationResponse:
     (all 5 float scores). Supports PII/secret scanning & redaction and produces
     normalized feature explainability weights.
     """
-    eng = get_engine()
-    if not eng:
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Model engine not loaded")
-
     try:
-        result, extraction_mode = _evaluate_interaction(payload)
+        result, extraction_mode = await _run_expensive(_evaluate_single_work, payload)
 
         # Track telemetry
         _record_telemetry(
@@ -801,6 +909,8 @@ async def evaluate_single(payload: EvaluationRequest) -> EvaluationResponse:
         )
 
         return EvaluationResponse(**result)
+    except HTTPException:
+        raise
     except (ValueError, KeyError):
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Invalid evaluation input.")
     except Exception:
@@ -809,34 +919,50 @@ async def evaluate_single(payload: EvaluationRequest) -> EvaluationResponse:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Inference failed.")
 
 
+def _evaluate_single_work(payload: EvaluationRequest) -> Tuple[Dict[str, Any], str]:
+    eng = get_engine()
+    if not eng:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Model engine not loaded")
+    return _evaluate_interaction(payload)
+
+
 @app.post("/evaluate/stream", tags=["Streaming"])
 async def evaluate_streaming(payload: EvaluationRequest) -> StreamingResponse:
     """Server-Sent Events (SSE) streaming guardrail for real-time generative responses.
 
     Streams safety checks and emits early terminate signals if safety constraints are breached.
     """
+    pii_detector = get_pii()
+    safe_prompt_id = pii_detector.redact_pii(payload.prompt_id)[0] if payload.prompt_id else None
+    executor = get_expensive_executor()
+    pii_scan_future: Future[List[Dict[str, Any]]] = Future()
+    evaluation_future = executor.try_submit(
+        _evaluate_stream_work,
+        payload,
+        pii_scan_future,
+    )
+    if evaluation_future is None:
+        raise _expensive_work_unavailable()
+
+    def resolve_cancelled_stream(future: Future[Any]) -> None:
+        if future.cancelled() and not pii_scan_future.done():
+            pii_scan_future.set_exception(RuntimeError("Streaming evaluation was cancelled."))
+
+    evaluation_future.add_done_callback(resolve_cancelled_stream)
+
     async def sse_generator() -> AsyncGenerator[str, None]:
         try:
-            pii_detector = get_pii()
-            safe_prompt_id = pii_detector.redact_pii(payload.prompt_id)[0] if payload.prompt_id else None
             # Event 1: Pipeline Init
             yield f"event: init\ndata: {json.dumps({'prompt_id': safe_prompt_id, 'status': 'connected'})}\n\n"
             await asyncio.sleep(0.01)
 
             # Event 2: PII Scan
-            pii_list = []
-            if payload.prompt_text:
-                if payload.redact_pii:
-                    _, entities = pii_detector.redact_pii(payload.prompt_text)
-                else:
-                    entities = pii_detector.detect_pii(payload.prompt_text)
-                pii_list = [e.to_dict(redacted=payload.redact_pii, source="prompt") for e in entities]
-
+            pii_list = await executor.wait(pii_scan_future)
             yield f"event: pii_scan\ndata: {json.dumps({'pii_count': len(pii_list), 'entities': pii_list})}\n\n"
             await asyncio.sleep(0.01)
 
             # Event 3: Evaluation Verdict
-            res, extraction_mode = _evaluate_interaction(payload)
+            res, extraction_mode = await executor.wait(evaluation_future)
 
             verdict_payload = {
                 "shield_decision": res["shield_decision"],
@@ -861,40 +987,69 @@ async def evaluate_streaming(payload: EvaluationRequest) -> StreamingResponse:
     return StreamingResponse(sse_generator(), media_type="text/event-stream")
 
 
+def _evaluate_stream_work(
+    payload: EvaluationRequest,
+    pii_scan_future: Future[List[Dict[str, Any]]],
+) -> Tuple[Dict[str, Any], str]:
+    try:
+        pii_detector = get_pii()
+        entities = []
+        if payload.prompt_text:
+            if payload.redact_pii:
+                _, entities = pii_detector.redact_pii(payload.prompt_text)
+            else:
+                entities = pii_detector.detect_pii(payload.prompt_text)
+        pii_list = [
+            entity.to_dict(redacted=payload.redact_pii, source="prompt")
+            for entity in entities
+        ]
+        pii_scan_future.set_result(pii_list)
+        return _evaluate_single_work(payload)
+    except BaseException as exc:
+        if not pii_scan_future.done():
+            pii_scan_future.set_exception(exc)
+        raise
+
+
 @app.post("/evaluate/batch", response_model=BatchEvaluationResponse, tags=["Inference"])
 async def evaluate_batch(batch: BatchEvaluationRequest) -> BatchEvaluationResponse:
     """Evaluate a batch of interactions. Supports mixed Text and Metric mode items."""
-    eng = get_engine()
-    if not eng:
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Model engine not loaded")
-
-    t_start = time.perf_counter()
-    results: List[EvaluationResponse] = []
-    allowed = flagged = blocked = 0
-
     try:
-        for item in batch.items:
-            result, extraction_mode = _evaluate_interaction(item)
-            res = EvaluationResponse(**result)
-            results.append(res)
-
-            _record_telemetry(
-                decision=res.shield_decision,
-                mode=extraction_mode,
-                latency_ms=res.latency_ms,
-            )
-
-            if res.shield_decision == "ALLOWED":
-                allowed += 1
-            elif res.shield_decision == "FLAGGED":
-                flagged += 1
-            else:
-                blocked += 1
+        return await _run_expensive(_evaluate_batch_work, batch)
+    except HTTPException:
+        raise
     except (ValueError, KeyError):
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Invalid evaluation input.")
     except Exception:
         logger.error("Batch evaluation failed.")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Batch evaluation failed.")
+
+
+def _evaluate_batch_work(batch: BatchEvaluationRequest) -> BatchEvaluationResponse:
+    eng = get_engine()
+    if not eng:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Model engine not loaded")
+    t_start = time.perf_counter()
+    results: List[EvaluationResponse] = []
+    allowed = flagged = blocked = 0
+
+    for item in batch.items:
+        result, extraction_mode = _evaluate_interaction(item)
+        res = EvaluationResponse(**result)
+        results.append(res)
+
+        _record_telemetry(
+            decision=res.shield_decision,
+            mode=extraction_mode,
+            latency_ms=res.latency_ms,
+        )
+
+        if res.shield_decision == "ALLOWED":
+            allowed += 1
+        elif res.shield_decision == "FLAGGED":
+            flagged += 1
+        else:
+            blocked += 1
 
     batch_latency = (time.perf_counter() - t_start) * 1000.0
     return BatchEvaluationResponse(
@@ -906,19 +1061,14 @@ async def evaluate_batch(batch: BatchEvaluationRequest) -> BatchEvaluationRespon
         batch_latency_ms=round(batch_latency, 2),
     )
 
-    return BatchEvaluationResponse(
-        results=results,
-        total_evaluated=len(results),
-        allowed_count=allowed,
-        flagged_count=flagged,
-        blocked_count=blocked,
-        batch_latency_ms=round((time.perf_counter() - t_start) * 1000.0, 2),
-    )
-
 
 @app.post("/drift/check", response_model=DriftCheckResponse, tags=["Drift Monitoring"])
 async def check_feature_drift(request: DriftCheckRequest) -> DriftCheckResponse:
     """Two-sample Kolmogorov-Smirnov drift test against the training baseline."""
+    return await _run_expensive(_check_feature_drift_work, request)
+
+
+def _check_feature_drift_work(request: DriftCheckRequest) -> DriftCheckResponse:
     df_base = get_baseline_df()
     if df_base is None or df_base.empty:
         raise HTTPException(
@@ -961,6 +1111,10 @@ async def check_feature_drift(request: DriftCheckRequest) -> DriftCheckResponse:
 @app.post("/drift/recalibrate", response_model=RecalibrateResponse, tags=["Drift Monitoring"])
 async def trigger_drift_recalibration(request: RecalibrateRequest) -> RecalibrateResponse:
     """Analyze production distribution drift and trigger automated adaptive threshold recalibration."""
+    return await _run_expensive(_recalibrate_work, request)
+
+
+def _recalibrate_work(request: RecalibrateRequest) -> RecalibrateResponse:
     recal_engine = get_recalibration_engine()
     result = recal_engine.recalibrate(
         production_samples=request.production_samples,
@@ -975,17 +1129,21 @@ async def simulate_red_team_campaign(
     response: Response,
 ) -> RedTeamSimulateResponse:
     """Execute an automated genetic adversarial red-teaming campaign against the shield."""
+    campaign_res = await _run_expensive(_run_red_team_work, request)
+    # Inject tamper-proof cryptographic receipt header
+    response.headers["X-Shield-Signature"] = campaign_res.cryptographic_receipt
+    return RedTeamSimulateResponse(**campaign_res.to_dict())
+
+
+def _run_red_team_work(request: RedTeamSimulateRequest):
     fuzzer = get_red_team_fuzzer()
     safe_seed_prompt = get_pii().redact_pii(request.seed_prompt)[0]
-    campaign_res = fuzzer.run_campaign(
+    return fuzzer.run_campaign(
         seed_prompt=safe_seed_prompt,
         rounds=request.rounds,
         allowed_types=request.mutation_types,
         trigger_recalibration=request.trigger_recalibration,
     )
-    # Inject tamper-proof cryptographic receipt header
-    response.headers["X-Shield-Signature"] = campaign_res.cryptographic_receipt
-    return RedTeamSimulateResponse(**campaign_res.to_dict())
 
 
 @app.get("/red-team/mutations", response_model=RedTeamMutationsResponse, tags=["Red Team"])
